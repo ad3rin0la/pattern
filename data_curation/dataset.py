@@ -9,7 +9,7 @@ archive for direct consumption by PyTorch / PyG data loaders.
 The dataset schema follows the ToPE convention:
     - One row per active site (not per atom)
     - Atomic-level data stored as variable-length arrays within each row
-    - Metadata columns for PDB ID, EC number, and split assignment
+    - Metadata columns for PDB ID, EC number, split, and kinetics labels
 """
 
 from __future__ import annotations
@@ -64,6 +64,11 @@ class DatasetRecord:
     mask_path: str = ""
     adjacency_dir: str = ""
 
+    # Kinetics labels (log10 values; None if unavailable)
+    log_kcat: Optional[float] = None       # log10(kcat / s⁻¹)
+    log_km: Optional[float] = None         # log10(Km / mM)
+    log_kcat_km: Optional[float] = None    # log10(kcat/Km)
+
     # Train / val / test split
     split: str = ""
 
@@ -96,6 +101,7 @@ class DatasetBuilder:
         features_list: List[ActiveSiteFeatures],
         split_ratios: Tuple[float, float, float] = (0.8, 0.1, 0.1),
         seed: int = 42,
+        kinetics_map: Optional[Dict[str, Dict[str, float]]] = None,
     ) -> List[DatasetRecord]:
         """Build the full dataset from active sites and their features.
 
@@ -108,12 +114,18 @@ class DatasetBuilder:
             (train, val, test) fractions. Must sum to 1.
         seed : int
             Random seed for split assignment.
+        kinetics_map : dict, optional
+            Mapping PDB ID → {param_type: log10_value} from the kinetics
+            aggregator. Used to attach kcat/Km labels to each sample.
 
         Returns
         -------
         list of DatasetRecord
         """
         assert len(active_sites) == len(features_list)
+
+        if kinetics_map is None:
+            kinetics_map = {}
 
         # Assign splits
         n = len(active_sites)
@@ -152,6 +164,12 @@ class DatasetBuilder:
 
             ec_top = site.ec_number.split(".")[0] if site.ec_number else ""
 
+            # Look up kinetics labels
+            kin = kinetics_map.get(site.pdb_id, {})
+            log_kcat = kin.get("kcat")
+            log_km = kin.get("Km")
+            log_kcat_km = kin.get("kcat/Km")
+
             record = DatasetRecord(
                 pdb_id=site.pdb_id,
                 ec_number=site.ec_number,
@@ -165,6 +183,9 @@ class DatasetBuilder:
                 features_path=str(features_path.relative_to(self.features_dir)),
                 mask_path=str(mask_path.relative_to(self.features_dir)),
                 adjacency_dir=str(adj_dir.relative_to(self.features_dir)),
+                log_kcat=log_kcat,
+                log_km=log_km,
+                log_kcat_km=log_kcat_km,
                 split=str(split_labels[i]),
             )
             records.append(record)
@@ -172,12 +193,18 @@ class DatasetBuilder:
             if (i + 1) % 100 == 0 or (i + 1) == n:
                 logger.info("Dataset assembly: %d / %d", i + 1, n)
 
+        kin_count = sum(
+            1 for r in records
+            if r.log_kcat is not None or r.log_km is not None
+        )
         logger.info(
-            "Dataset built: %d samples (train=%d, val=%d, test=%d)",
+            "Dataset built: %d samples (train=%d, val=%d, test=%d), "
+            "%d with kinetics labels",
             n,
             sum(1 for r in records if r.split == "train"),
             sum(1 for r in records if r.split == "val"),
             sum(1 for r in records if r.split == "test"),
+            kin_count,
         )
 
         # Save index
@@ -237,6 +264,9 @@ class DatasetBuilder:
         split_dist: Dict[str, int] = {}
         atom_counts = []
         metal_count = 0
+        has_kcat = 0
+        has_km = 0
+        has_both = 0
 
         for r in records:
             ec_dist[r.ec_top_level] = ec_dist.get(r.ec_top_level, 0) + 1
@@ -244,6 +274,14 @@ class DatasetBuilder:
             atom_counts.append(r.n_atoms)
             if r.has_metal:
                 metal_count += 1
+            r_has_kcat = r.log_kcat is not None
+            r_has_km = r.log_km is not None
+            if r_has_kcat:
+                has_kcat += 1
+            if r_has_km:
+                has_km += 1
+            if r_has_kcat and r_has_km:
+                has_both += 1
 
         atom_arr = np.array(atom_counts)
 
@@ -265,6 +303,12 @@ class DatasetBuilder:
                 "median": float(np.median(atom_arr)),
             },
             "metalloenzyme_fraction": metal_count / n,
+            "kinetics_coverage": {
+                "has_kcat": has_kcat,
+                "has_km": has_km,
+                "has_both": has_both,
+                "fraction_with_any": (has_kcat + has_km - has_both) / n if n > 0 else 0,
+            },
         }
 
     # ── Loading (for downstream consumers) ───────────────────────────────
@@ -325,6 +369,20 @@ class DatasetBuilder:
             result[radius] = np.load(str(npy_path))
         return result
 
+    @staticmethod
+    def load_kinetics(record: Dict[str, Any]) -> Dict[str, Optional[float]]:
+        """Extract kinetics labels from a dataset record.
+
+        Returns
+        -------
+        dict with keys "log_kcat", "log_km", "log_kcat_km"
+        """
+        return {
+            "log_kcat": record.get("log_kcat"),
+            "log_km": record.get("log_km"),
+            "log_kcat_km": record.get("log_kcat_km"),
+        }
+
     # ── Private ──────────────────────────────────────────────────────────
 
     @staticmethod
@@ -343,5 +401,8 @@ class DatasetBuilder:
             "features_path": r.features_path,
             "mask_path": r.mask_path,
             "adjacency_dir": r.adjacency_dir,
+            "log_kcat": r.log_kcat,
+            "log_km": r.log_km,
+            "log_kcat_km": r.log_kcat_km,
             "split": r.split,
         }

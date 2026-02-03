@@ -221,6 +221,7 @@ function FoundationSection() {
     { ioffe: "Additive averaging of orbital parameters for multi-component systems", topo: "SE(3)-equivariant aggregation across hierarchical PCC levels", theme: "Multi-level representation" },
     { ioffe: "Boolean conjunctions in Prognoz-73 (logic-vector classification)", topo: "Combinatorial complex cell interactions (0-/1-/2-cells)", theme: "Discrete structural encoding" },
     { ioffe: "Classifying power αcl vs predictive power αpr separation", topo: "Train / validation / test F-score decomposition (TopEC: 0.72 F)", theme: "Generalization metrics" },
+    { ioffe: "Quantitative activity prediction (rate, selectivity %)", topo: "Multi-task regression: log(kcat), Km, kcat/Km (CataPro R²=0.67)", theme: "Kinetic prediction" },
   ];
   return (
     <div className="panel">
@@ -258,6 +259,7 @@ function FoundationSection() {
 
       <div className="prose">
         <p>Ioffe identified eight influential properties for CO oxidation from an initial set of twenty, and only four of those eight were individually correlated with activity. The remaining four were only "visible" when considered as a <strong>combination</strong>. This is precisely the regime where topological methods excel — they capture <strong>higher-order interactions</strong> that pairwise correlations miss.</p>
+        <p>The modern kinetics prediction landscape reinforces this insight. CataPro achieves <strong>R² = 0.67 (kcat)</strong> and <strong>R² = 0.73 (Km)</strong> using sequence + structure features, while DeepEnzyme maintains <strong>R² = 0.42</strong> at &lt;50% sequence identity — exactly the out-of-distribution regime where topological active-site encoding should provide a genuine edge over sequence-only methods.</p>
       </div>
     </div>
   );
@@ -344,6 +346,7 @@ function ModelDesignSection() {
     { id: 2, label: "SE(3)-Equivariant Cell Messages", desc: "Messages passed across 0→1→2-cells with rotation-translation invariance. Inherits TCPNet's architecture but operates on enzyme active-site complexes.", source: "Topotein (Wang et al. 2025)" },
     { id: 3, label: "Catalytic-Residue Attention Mask", desc: "Learned attention weights biased toward residues in catalytic site annotations (M-CSA / CSA). Mirrors Ioffe's criterion-influence ranking as a soft mask.", source: "TopEC (van der Weg et al. 2025)" },
     { id: 4, label: "Substrate-Product Correspondence", desc: "Ioffe showed selectivity depends on reactant–product property alignment. Encode this as a bipartite graph between substrate topology and product topology, fed into a cross-attention layer.", source: "Ioffe 1983 (Table 6); GraphEC 2024" },
+    { id: 5, label: "Kinetics Regression Head", desc: "Dedicated regression heads for log(kcat), log(Km), and log(kcat/Km). Trained jointly with EC classification using BRENDA/SABIO-RK kinetics data (~23k kcat, ~41k Km entries). Benchmarked against CataPro (R²=0.67) and DeepEnzyme (R²=0.42 at <50% identity).", source: "CataPro (Nat Commun 2025); DeepEnzyme (Brief Bioinform 2024)" },
   ];
 
   return (
@@ -374,8 +377,8 @@ function ModelDesignSection() {
         </div>
         <div className="pipe-step" style={{background:'rgba(212,160,138,0.06)', borderColor:'rgba(212,160,138,0.2)'}}>
           <div className="pipe-num">PREDICT</div>
-          <div className="pipe-label">EC Class + Selectivity</div>
-          <div className="pipe-desc">+ Inverse attribution</div>
+          <div className="pipe-label">EC + kcat/Km + Sel.</div>
+          <div className="pipe-desc">Multi-task + attribution</div>
         </div>
       </div>
 
@@ -398,10 +401,12 @@ function ModelDesignSection() {
         <p><strong>Inverse attribution (the "inverse ToPE" problem):</strong> After training, freeze the network and run <code>grad-CAM</code> or integrated-gradients over the persistent spectral features. The resulting saliency map across filtration radii and cell dimensions directly tells you <em>which topological scale</em> and <em>which interaction type</em> drives selectivity — a modernised version of Ioffe's sliding-recognition criterion ranking.</p>
       </div>
 
-      <div className="math-block">{`# Pseudo-loss: classification + inverse attribution regulariser
+      <div className="math-block">{`# Pseudo-loss: multi-task classification + kinetics + attribution
 L = L_CE(ŷ, y_EC)                         # EC-class cross-entropy
-  + λ · L_sel(ŷ_sel, y_selectivity)        # selectivity regression
-  + μ · KL( attr(ε*) ‖ prior_CSA )         # attribution should align
+  + λ₁ · L_sel(ŷ_sel, y_selectivity)       # selectivity regression
+  + λ₂ · L_kin(ŷ_kcat, y_log_kcat)         # log(kcat) MSE
+  + λ₃ · L_kin(ŷ_Km, y_log_Km)             # log(Km) MSE
+  + μ  · KL( attr(ε*) ‖ prior_CSA )        # attribution should align
                                             # with known catalytic sites`}</div>
     </div>
   );
@@ -410,9 +415,10 @@ L = L_CE(ŷ, y_EC)                         # EC-class cross-entropy
 function RoadmapSection() {
   const phases = [
     { label: "Phase 1", title: "Baseline & Data", done: true, items: [
-      { t: "Curate enzyme active-site dataset from M-CSA + PDB (≥5 000 structures)", d: "Training sample assembly — mirrors Ioffe's data-bank step" },
+      { t: "Curate enzyme active-site dataset from M-CSA + PDB (\u22655,000 structures)", d: "Training sample assembly \u2014 mirrors Ioffe\u2019s data-bank step" },
+      { t: "Integrate BRENDA/SABIO-RK kinetics (~23k kcat, ~41k Km entries)", d: "Quantitative activity labels for regression heads" },
       { t: "Implement persistent Laplacian filtration pipeline (gudhi / giotto-tda)", d: "Core topological encoding" },
-      { t: "Benchmark against TopEC & GraphEC baselines on EC classification", d: "Establish performance floor" },
+      { t: "Benchmark against TopEC, GraphEC (EC), CataPro/DeepEnzyme (kcat)", d: "Establish performance floor across classification + kinetics" },
     ]},
     { label: "Phase 2", title: "Topological Encoding", done: true, items: [
       { t: "Build Enzyme Combinatorial Complex (Enzyme-PCC)", d: "Adapt PCC from Topotein to catalytic active sites" },
@@ -421,13 +427,14 @@ function RoadmapSection() {
     ]},
     { label: "Phase 3", title: "Full ToPE Model", done: false, items: [
       { t: "Implement TCPNet-style SE(3) message passing over Enzyme-PCC", d: "" },
-      { t: "Add substrate–product bipartite cross-attention", d: "Ioffe's selectivity correspondence" },
-      { t: "Train on EC classification + selectivity regression jointly", d: "" },
+      { t: "Add substrate\u2013product bipartite cross-attention", d: "Ioffe\u2019s selectivity correspondence" },
+      { t: "Train multi-task on EC (F-score) + selectivity + log(kcat/Km) jointly", d: "Unified classification + kinetics regression" },
     ]},
-    { label: "Phase 4", title: "Inverse Attribution", done: false, items: [
+    { label: "Phase 4", title: "Inverse Attribution & Validation", done: false, items: [
       { t: "Derive saliency maps over (filtration radius, cell dimension)", d: "Which topological scale matters" },
-      { t: "Validate against experimentally annotated catalytic residues (CSA)", d: "" },
-      { t: "Compare ranked features to Ioffe's known influential properties", d: "Close the loop" },
+      { t: "Validate kinetics on out-of-distribution enzymes (<40% seq identity)", d: "DeepEnzyme holds R\u00B2=0.42 at <50%; ToPE targets R\u00B2>0.50 at <40%" },
+      { t: "Compare ranked features to Ioffe\u2019s 8 influential CO oxidation properties", d: "Close the loop" },
+      { t: "Experimental validation: predict kcat for 10 unseen enzyme variants", d: "Wet-lab confirmation of topological predictions" },
     ]},
   ];
 
@@ -461,12 +468,12 @@ function RoadmapSection() {
       ))}
 
       <div className="callout" style={{ marginTop: 36 }}>
-        <div className="callout-label">Validation Strategy</div>
-        <p>Ioffe demanded ~80–85% prediction accuracy to be "economically effective." For enzyme function, TopEC achieves F = 0.72 across 800+ EC classes — already competitive. ToPE targets <strong>selectivity prediction</strong> (the harder problem Ioffe flagged) where topological encoding of the active-site cavity geometry should provide a genuine edge over graph-only methods.</p>
+        <div className="callout-label">Validation Strategy & Performance Targets</div>
+        <p>Ioffe demanded ~80–85% prediction accuracy to be "economically effective." For enzyme function, TopEC achieves F = 0.72 across 800+ EC classes. For kinetics, CataPro reaches <strong>R² = 0.67 (kcat)</strong> and <strong>R² = 0.73 (Km)</strong>; DeepEnzyme maintains <strong>R² = 0.42</strong> at &lt;50% sequence identity. ToPE targets: <strong>(1)</strong> EC F-score &gt; 0.75, <strong>(2)</strong> selectivity MAE &lt; 12%, <strong>(3)</strong> kcat R² &gt; 0.50 at &lt;40% identity where topological active-site encoding should provide a genuine edge.</p>
       </div>
 
       <div className="prose" style={{marginTop:24}}>
-        <p><strong>Key references to track:</strong> Topotein (arXiv 2509.03885), TopEC (Nat Commun 2025), Persistent Sheaf Laplacian (J Phys Chem B 2025), Persistent Topological Laplacians survey (Mathematics 2025), TopoDockQ (Comm Chem 2025), and the TDA review (arXiv 2509.16877).</p>
+        <p><strong>Key references to track:</strong> Topotein (arXiv 2509.03885), TopEC (Nat Commun 2025), Persistent Sheaf Laplacian (J Phys Chem B 2025), DeepEnzyme (Brief Bioinform 2024), CataPro (Nat Commun 2025), GraphKcat (bioRxiv 2025), KcatNet (bioRxiv 2025), CatPred (Nat Commun 2025).</p>
       </div>
     </div>
   );
@@ -496,6 +503,7 @@ export default function App() {
             <span className="meta-tag">Ioffe et al. 1983</span>
             <span className="meta-tag">Topotein · arXiv 2509.03885</span>
             <span className="meta-tag">Persistent Laplacians</span>
+            <span className="meta-tag">BRENDA / SABIO-RK</span>
             <span className="meta-tag">Enzyme Catalysis</span>
           </div>
         </div>

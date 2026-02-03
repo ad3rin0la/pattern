@@ -20,6 +20,7 @@ DATA_ROOT = Path(os.environ.get("TOPE_DATA_ROOT", "data"))
 RAW_DIR = DATA_ROOT / "raw"
 PDB_DIR = RAW_DIR / "pdb"
 MCSA_DIR = RAW_DIR / "mcsa"
+KINETICS_DIR = RAW_DIR / "kinetics"
 PROCESSED_DIR = DATA_ROOT / "processed"
 FEATURES_DIR = DATA_ROOT / "features"
 
@@ -38,6 +39,61 @@ MCSA_RESIDUES_URL = "https://www.ebi.ac.uk/thornton-srv/m-csa/api/residues/"
 MCSA_CSV_URL = (
     "https://www.ebi.ac.uk/thornton-srv/m-csa/api/entries/?format=csv"
 )
+
+
+# ── BRENDA & SABIO-RK (Enzyme Kinetics) ───────────────────────────────────────
+#
+# BRENDA: ~23k kcat entries, ~41k Km entries across all EC classes.
+# SABIO-RK: structured reaction kinetics with explicit conditions.
+# Together they provide the quantitative activity labels needed for
+# the kinetics regression heads (log kcat, log Km, log kcat/Km).
+
+BRENDA_DOWNLOAD_URL = "https://www.brenda-enzymes.org/download.php"
+SABIO_RK_API_URL = "http://sabiork.h-its.org/sabioRestWebServices"
+SABIO_RK_SEARCH_URL = f"{SABIO_RK_API_URL}/searchKineticLaws/sbml"
+SABIO_RK_ENTRY_URL = f"{SABIO_RK_API_URL}/kineticLaws"
+
+# Kinetics parameter types to extract
+KINETICS_PARAM_TYPES = ["kcat", "Km", "kcat/Km", "Ki", "Vmax"]
+
+# Expected dataset sizes (approximate, for progress reporting)
+EXPECTED_BRENDA_KCAT = 23_000
+EXPECTED_BRENDA_KM = 41_000
+
+
+# ── Performance Targets ───────────────────────────────────────────────────────
+#
+# Baselines and ToPE targets from the roadmap:
+#
+# EC classification:
+#   TopEC:      F = 0.72  (800+ EC classes)
+#   GraphEC:    F = 0.68
+#   ToPE target: F > 0.75
+#
+# Kinetics prediction:
+#   CataPro:    R² = 0.67 (kcat), R² = 0.73 (Km)
+#   DeepEnzyme: R² = 0.42 (kcat, <50% seq identity)
+#   ToPE target: R² > 0.50 (kcat, <40% seq identity)
+#
+# Selectivity:
+#   ToPE target: MAE < 12%
+
+PERFORMANCE_TARGETS = {
+    "ec_f_score": 0.75,
+    "selectivity_mae": 0.12,
+    "kcat_r2_ood": 0.50,         # out-of-distribution (<40% seq identity)
+    "kcat_r2_ood_threshold": 0.40,  # sequence identity cutoff
+}
+
+BASELINE_PERFORMANCE = {
+    "TopEC": {"ec_f_score": 0.72},
+    "GraphEC": {"ec_f_score": 0.68},
+    "CataPro": {"kcat_r2": 0.67, "km_r2": 0.73},
+    "DeepEnzyme": {"kcat_r2_lt50": 0.42},
+    "GraphKcat": {},
+    "KcatNet": {},
+    "CatPred": {},
+}
 
 
 # ── Active-Site Extraction ────────────────────────────────────────────────────
@@ -189,6 +245,14 @@ class PipelineConfig:
     filtration_radii: List[float] = field(
         default_factory=lambda: list(FILTRATION_RADII)
     )
+
+    # Kinetics data
+    fetch_kinetics: bool = True          # integrate BRENDA/SABIO-RK
+    brenda_flat_file: str = ""           # path to BRENDA flat file (if pre-downloaded)
+    kinetics_params: List[str] = field(
+        default_factory=lambda: ["kcat", "Km", "kcat/Km"]
+    )
+    min_kinetics_entries: int = 1000     # skip EC classes with fewer entries
 
     # Parallelism
     n_workers: int = 4

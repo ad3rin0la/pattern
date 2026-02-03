@@ -3,10 +3,11 @@ Main pipeline orchestrator for ToPE data curation.
 
 Ties together:
     1. M-CSA → catalytic site annotations
-    2. RCSB PDB → structure download
-    3. Active-site extraction (BioPython)
-    4. Physicochemical feature computation (Ioffe descriptors)
-    5. Dataset assembly and storage
+    2. BRENDA / SABIO-RK → kinetic parameters (kcat, Km, kcat/Km)
+    3. RCSB PDB → structure download
+    4. Active-site extraction (BioPython)
+    5. Physicochemical feature computation (Ioffe descriptors)
+    6. Dataset assembly and storage (with kinetics labels)
 
 Usage
 -----
@@ -40,6 +41,11 @@ from data_curation.config import (
 )
 from data_curation.dataset import DatasetBuilder, DatasetRecord
 from data_curation.features import ActiveSiteFeatures, FeatureComputer
+from data_curation.kinetics_client import (
+    KineticsAggregator,
+    KineticEntry,
+    KineticsSummary,
+)
 from data_curation.mcsa_client import MCSAClient, MCSAEntry
 from data_curation.pdb_client import PDBClient
 
@@ -51,6 +57,7 @@ class CurationPipeline:
 
     Implements Phase 1 of the ToPE roadmap:
         - Curate enzyme active-site dataset from M-CSA + PDB (≥5 000 structures)
+        - Integrate BRENDA/SABIO-RK kinetics (~23k kcat, ~41k Km entries)
         - Compute Ioffe-style physicochemical descriptors
         - Produce filtration-ready adjacency matrices
         - Export as Parquet / NumPy arrays for downstream topological encoding
@@ -67,6 +74,9 @@ class CurationPipeline:
         self.pdb = PDBClient(
             cache_dir=self.config.data_root / "raw" / "pdb",
             request_delay=self.config.request_delay,
+        )
+        self.kinetics = KineticsAggregator(
+            cache_dir=self.config.data_root / "raw" / "kinetics",
         )
         self.extractor = ActiveSiteExtractor(config=self.config)
         self.featuriser = FeatureComputer(
@@ -111,30 +121,37 @@ class CurationPipeline:
 
         # ── Step 1: Fetch M-CSA annotations ──────────────────────────────
         logger.info("─" * 40)
-        logger.info("Step 1/5: Fetching M-CSA catalytic site annotations")
+        logger.info("Step 1/6: Fetching M-CSA catalytic site annotations")
         mcsa_entries = self._step_fetch_mcsa(ec_prefix, max_entries)
 
-        # ── Step 2: Resolve PDB IDs ──────────────────────────────────────
+        # ── Step 2: Fetch kinetics (BRENDA + SABIO-RK) ───────────────────
         logger.info("─" * 40)
-        logger.info("Step 2/5: Resolving PDB structures")
+        logger.info("Step 2/6: Fetching kinetic parameters (BRENDA + SABIO-RK)")
+        kinetics_map = self._step_fetch_kinetics(mcsa_entries)
+
+        # ── Step 3: Resolve PDB IDs ──────────────────────────────────────
+        logger.info("─" * 40)
+        logger.info("Step 3/6: Resolving PDB structures")
         pdb_ids = self._step_resolve_pdb_ids(mcsa_entries)
 
-        # ── Step 3: Download structures ──────────────────────────────────
+        # ── Step 4: Download structures ──────────────────────────────────
         logger.info("─" * 40)
-        logger.info("Step 3/5: Downloading PDB structures")
+        logger.info("Step 4/6: Downloading PDB structures")
         structure_paths = self._step_download_structures(pdb_ids, skip_download)
 
-        # ── Step 4: Extract active sites + compute features ──────────────
+        # ── Step 5: Extract active sites + compute features ──────────────
         logger.info("─" * 40)
-        logger.info("Step 4/5: Extracting active sites and computing features")
+        logger.info("Step 5/6: Extracting active sites and computing features")
         active_sites, features_list = self._step_extract_and_featurise(
             mcsa_entries, structure_paths,
         )
 
-        # ── Step 5: Assemble dataset ─────────────────────────────────────
+        # ── Step 6: Assemble dataset (with kinetics) ─────────────────────
         logger.info("─" * 40)
-        logger.info("Step 5/5: Assembling dataset")
-        records = self._step_assemble_dataset(active_sites, features_list)
+        logger.info("Step 6/6: Assembling dataset with kinetics labels")
+        records = self._step_assemble_dataset(
+            active_sites, features_list, kinetics_map,
+        )
 
         elapsed = time.time() - t0
         logger.info("=" * 60)
@@ -174,6 +191,64 @@ class CurationPipeline:
                      summary["total_entries"], summary["unique_pdb_ids"],
                      summary["total_catalytic_residues"])
         return entries
+
+    def _step_fetch_kinetics(
+        self, mcsa_entries: List[MCSAEntry]
+    ) -> Dict[str, Dict[str, float]]:
+        """Step 2: Fetch kinetic parameters and build PDB→kinetics map."""
+        if not self.config.fetch_kinetics:
+            logger.info("Kinetics fetching disabled — skipping")
+            return {}
+
+        # Collect unique EC numbers from M-CSA entries
+        ec_numbers = sorted({e.ec_number for e in mcsa_entries if e.ec_number})
+        logger.info("Querying kinetics for %d unique EC numbers", len(ec_numbers))
+
+        brenda_path = (
+            Path(self.config.brenda_flat_file)
+            if self.config.brenda_flat_file
+            else None
+        )
+
+        entries = self.kinetics.collect(
+            ec_numbers=ec_numbers,
+            brenda_flat_file=brenda_path,
+            include_mutants=False,
+            param_types=self.config.kinetics_params,
+        )
+
+        # Build maps
+        ec_map = self.kinetics.build_ec_kinetics_map(entries)
+        pdb_map = self.kinetics.build_pdb_kinetics_map(entries)
+
+        summary = self.kinetics.summarise(entries)
+        logger.info(
+            "Kinetics: %d entries (kcat=%d, Km=%d, kcat/Km=%d), "
+            "%d with PDB cross-ref, %d unique ECs",
+            summary.total_entries, summary.kcat_count, summary.km_count,
+            summary.kcat_km_count, summary.entries_with_pdb,
+            summary.unique_ec_numbers,
+        )
+
+        # For samples without direct PDB kinetics, fall back to EC-level medians
+        # Build a combined map: PDB-level takes priority, then EC-level
+        combined: Dict[str, Dict[str, float]] = {}
+
+        # First populate from EC map (keyed by PDB ID via M-CSA entries)
+        for entry in mcsa_entries:
+            if entry.pdb_id and entry.ec_number in ec_map:
+                combined.setdefault(entry.pdb_id, {}).update(ec_map[entry.ec_number])
+
+        # Then override with PDB-specific data where available
+        for pdb_id, params in pdb_map.items():
+            combined.setdefault(pdb_id, {}).update(params)
+
+        logger.info(
+            "Kinetics coverage: %d / %d PDB IDs have kinetic labels",
+            len(combined), len({e.pdb_id for e in mcsa_entries}),
+        )
+
+        return combined
 
     def _step_resolve_pdb_ids(
         self, mcsa_entries: List[MCSAEntry]
@@ -271,9 +346,12 @@ class CurationPipeline:
         self,
         active_sites: List[ActiveSite],
         features_list: List[ActiveSiteFeatures],
+        kinetics_map: Optional[Dict[str, Dict[str, float]]] = None,
     ) -> List[DatasetRecord]:
-        """Step 5: Build the final dataset with train/val/test splits."""
-        return self.dataset_builder.build(active_sites, features_list)
+        """Step 6: Build the final dataset with train/val/test splits and kinetics."""
+        return self.dataset_builder.build(
+            active_sites, features_list, kinetics_map=kinetics_map,
+        )
 
     # ── Utilities ────────────────────────────────────────────────────────
 
@@ -291,6 +369,12 @@ class CurationPipeline:
                          stats.get("min", 0), stats.get("max", 0))
         logger.info("  Metalloenzymes: %.1f%%",
                      summary.get("metalloenzyme_fraction", 0) * 100)
+        kin = summary.get("kinetics_coverage", {})
+        if kin:
+            logger.info("  Kinetics coverage:")
+            logger.info("    Samples with kcat: %d", kin.get("has_kcat", 0))
+            logger.info("    Samples with Km:   %d", kin.get("has_km", 0))
+            logger.info("    Samples with both:  %d", kin.get("has_both", 0))
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
@@ -327,6 +411,14 @@ def main() -> None:
         help="Skip PDB download (use cached files)",
     )
     parser.add_argument(
+        "--skip-kinetics", action="store_true",
+        help="Skip BRENDA/SABIO-RK kinetics fetching",
+    )
+    parser.add_argument(
+        "--brenda-file", type=str, default="",
+        help="Path to BRENDA flat file (brenda_download.txt)",
+    )
+    parser.add_argument(
         "--output-format", choices=["parquet", "csv", "json"],
         default="parquet", help="Dataset index output format",
     )
@@ -358,6 +450,8 @@ def main() -> None:
         output_format=args.output_format,
         data_root=Path(args.data_root),
         n_workers=args.workers,
+        fetch_kinetics=not args.skip_kinetics,
+        brenda_flat_file=args.brenda_file,
     )
 
     pipeline = CurationPipeline(config)
