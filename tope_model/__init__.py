@@ -1,5 +1,5 @@
 """
-ToPE Model — Phase 3-5: Full Topological Deep Learning Architecture
+ToPE Model — Phase 3-6: Full Topological Deep Learning Architecture
 ===================================================================
 
 Integrates Phase 2 persistent spectral features into a complete
@@ -18,6 +18,10 @@ Model Variants:
         4-level hierarchy (atoms → bonds → residues → subunits → interfaces)
         with cross-subunit message passing and cooperativity prediction.
 
+    **CompletePToPEModel** (learnable p-Laplacian):
+        Nonlinear diffusion with learnable p-parameters encoding mechanistic
+        regimes across topological scales. Connects to Eyring/Arrhenius theory.
+
 Phase 4 Validation & Attribution:
 
     **MultiScaleAttributionAnalyzer**:
@@ -26,27 +30,34 @@ Phase 4 Validation & Attribution:
     **StratifiedOODValidator**:
         2D validation matrix (sequence identity × mutation distance).
 
-    **KnownAllostericValidator**:
-        Recovery of literature-documented allosteric effects.
-
 Phase 5 Multi-Subunit Handling:
 
     **MultiSubunitPCCBuilder**:
-        Constructs 4-level hierarchical complex with 3-cells (subunits)
-        and 4-cells (interfaces).
-
-    **MultiSubunitTCPNet**:
-        Message passing across all cell dimensions including inter-subunit
-        communication via interfaces.
+        Constructs 4-level hierarchical complex with 3-cells and 4-cells.
 
     **AllostericCooperativityHead**:
         Predicts Hill coefficient for cooperative binding.
+
+Phase 6 Learnable p-Laplacian:
+
+    **LearnablePLaplacianToPE**:
+        Multi-scale p-parameter grid with T_eff ∝ T/p interpretation.
+
+    **NodalDomainExtractor**:
+        Extract Eyring reaction channels from eigenmode nodal domains.
+
+    **MechanisticAnalyzer**:
+        Interpretability from learned p-landscape (rate-limiting steps).
+
+    **ExperimentalPredictor**:
+        Predictions for KIE, temperature dependence, pressure effects.
 
 Components:
     tcpnet                — TCPNet-style message passing over Enzyme-PCC
     whole_protein_tcpnet  — Multi-scale message passing over whole protein
     multi_scale_graph     — Three-zone protein graph construction
     multi_subunit         — Quaternary structure with 3/4-cells
+    p_laplacian           — Learnable p-Laplacian for mechanistic interpretability
     cross_attention       — Substrate-product bipartite cross-attention
     task_heads            — EC, selectivity, kinetics, mutation heads
     losses                — Multi-task loss with uncertainty weighting
@@ -72,6 +83,13 @@ Usage:
     model = MultiSubunitToPEModel(MultiSubunitToPEConfig())
     preds = model(enzyme_pcc)
     hill_coeff = preds["hill_coefficient"]  # Cooperativity
+
+    # Learnable p-Laplacian (mechanistic interpretability):
+    from tope_model import CompletePToPEModel, MechanisticAnalyzer
+
+    model = CompletePToPEModel()
+    analysis = model.get_mechanistic_analysis(enzyme_pcc)
+    print(analysis.interpretations)  # Rate-limiting step identification
 
     # Phase 4 attribution:
     from tope_model import MultiScaleAttributionAnalyzer, StratifiedOODValidator
@@ -126,6 +144,25 @@ from tope_model.multi_subunit import (
     build_multisubunit_enzyme_pcc,
     extract_allosteric_features_from_pcc,
 )
+from tope_model.p_laplacian import (
+    # Core p-Laplacian
+    LearnablePLaplacianToPE,
+    PLaplacianConfig,
+    PLaplacianEigensolver,
+    # Nodal Domains
+    NodalDomainExtractor,
+    ReactionChannel,
+    # Training
+    PToPELoss,
+    # Interpretability
+    MechanisticAnalyzer,
+    MechanisticInterpretation,
+    # Experimental Predictions
+    ExperimentalPredictor,
+    # Complete Model
+    CompletePToPEModel,
+    CompletePToPEConfig,
+)
 
 __all__ = [
     # Phase 3: Models
@@ -173,4 +210,21 @@ __all__ = [
     # Phase 5: Utilities
     "build_multisubunit_enzyme_pcc",
     "extract_allosteric_features_from_pcc",
+    # Phase 6: p-Laplacian Core
+    "LearnablePLaplacianToPE",
+    "PLaplacianConfig",
+    "PLaplacianEigensolver",
+    # Phase 6: Nodal Domains
+    "NodalDomainExtractor",
+    "ReactionChannel",
+    # Phase 6: Training
+    "PToPELoss",
+    # Phase 6: Interpretability
+    "MechanisticAnalyzer",
+    "MechanisticInterpretation",
+    # Phase 6: Experimental Predictions
+    "ExperimentalPredictor",
+    # Phase 6: Complete Model
+    "CompletePToPEModel",
+    "CompletePToPEConfig",
 ]
