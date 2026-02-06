@@ -163,6 +163,20 @@ from tope_model.p_laplacian import (
     CompletePToPEModel,
     CompletePToPEConfig,
 )
+from tope_model.mcp_adapters import (
+    # Base Adapter
+    MCPAdapter,
+    # AlphaFold
+    AlphaFoldMCPAdapter,
+    AlphaFoldStructure,
+    # ChEMBL
+    ChEMBLMCPAdapter,
+    ChEMBLKineticsData,
+    # PubChem
+    PubChemMCPAdapter,
+    # Pipeline
+    MCPEnhancedPipeline,
+)
 
 __all__ = [
     # Phase 3: Models
@@ -227,4 +241,12 @@ __all__ = [
     # Phase 6: Complete Model
     "CompletePToPEModel",
     "CompletePToPEConfig",
+    # MCP Adapters
+    "MCPAdapter",
+    "AlphaFoldMCPAdapter",
+    "AlphaFoldStructure",
+    "ChEMBLMCPAdapter",
+    "ChEMBLKineticsData",
+    "PubChemMCPAdapter",
+    "MCPEnhancedPipeline",
 ]
