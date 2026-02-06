@@ -37,18 +37,6 @@ ToPE (Topological Pattern Recognition for Enzymes) is a deep learning architectu
 
 ---
 
-## 📊 Performance
-
-| Task | Metric | ToPE | Baseline | Improvement |
-|------|--------|------|----------|-------------|
-| **EC Classification** | F-score (seen classes) | **0.75** | 0.72 (TopEC) | +4% |
-| **EC Classification** | F-score (unseen classes) | **0.52** | 0.42 | +24% |
-| **kcat Prediction** | R² (<40% seq ID) | **0.51** | 0.432 (GraphKcat) | +18% |
-| **Selectivity** | MAE | **11.2%** | N/A | Baseline |
-| **Substrate Ranking** | Spearman ρ | **0.65** | N/A | Baseline |
-
-*<40% sequence identity ensures model relies on structural topology, not sequence homology*
-
 ---
 
 ## 🏗️ Architecture Overview
