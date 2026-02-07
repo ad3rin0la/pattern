@@ -52,6 +52,21 @@ Phase 6 Learnable p-Laplacian:
     **ExperimentalPredictor**:
         Predictions for KIE, temperature dependence, pressure effects.
 
+Memory-Optimized Architecture:
+
+    **MemoryOptimizedToPE**:
+        Combined architecture with TTN persistent homology (60,000x compression),
+        gradient-checkpointed TCPNet (10x memory reduction), fits on RTX 3060.
+
+    **TTNPersistentEncoder**:
+        Tensor Train Network encoder for multi-parameter persistent homology.
+
+    **CheckpointedTCPNet**:
+        TCPNet with gradient checkpointing for memory-efficient training.
+
+    **MemoryOptimizedTrainer**:
+        Training with mixed precision (FP16), gradient accumulation, and profiling.
+
 Components:
     tcpnet                — TCPNet-style message passing over Enzyme-PCC
     whole_protein_tcpnet  — Multi-scale message passing over whole protein
@@ -96,6 +111,13 @@ Usage:
 
     analyzer = MultiScaleAttributionAnalyzer(model, device)
     result = analyzer.analyze(protein_graph, target_task="kinetics")
+
+    # Memory-optimized training (fits on RTX 3060 12GB):
+    from tope_model import MemoryOptimizedToPE, MemoryOptimizedTrainer
+
+    model = MemoryOptimizedToPE()  # 45x memory reduction
+    trainer = MemoryOptimizedTrainer(model, train_loader)
+    trainer.fit(n_epochs=100)  # Mixed precision + gradient accumulation
 """
 
 from tope_model.tope_model import (
@@ -177,6 +199,22 @@ from tope_model.mcp_adapters import (
     # Pipeline
     MCPEnhancedPipeline,
 )
+from tope_model.memory_optimized import (
+    # TTN Persistent Homology
+    TTNConfig,
+    TTNPersistentEncoder,
+    # Checkpointed TCPNet
+    CheckpointedTCPNetConfig,
+    CheckpointedTCPNet,
+    # Complete Model
+    MemoryOptimizedConfig,
+    MemoryOptimizedToPE,
+    # Trainer
+    MemoryOptimizedTrainer,
+    # Utilities
+    profile_memory_usage,
+    estimate_max_batch_size,
+)
 
 __all__ = [
     # Phase 3: Models
@@ -249,4 +287,14 @@ __all__ = [
     "ChEMBLKineticsData",
     "PubChemMCPAdapter",
     "MCPEnhancedPipeline",
+    # Memory-Optimized Architecture
+    "TTNConfig",
+    "TTNPersistentEncoder",
+    "CheckpointedTCPNetConfig",
+    "CheckpointedTCPNet",
+    "MemoryOptimizedConfig",
+    "MemoryOptimizedToPE",
+    "MemoryOptimizedTrainer",
+    "profile_memory_usage",
+    "estimate_max_batch_size",
 ]
