@@ -67,6 +67,18 @@ Memory-Optimized Architecture:
     **MemoryOptimizedTrainer**:
         Training with mixed precision (FP16), gradient accumulation, and profiling.
 
+TTN Multi-Parameter Persistent Homology:
+
+    **MultiParameterTTN**:
+        GPU-native tensor tree network replacing CPU-bound gudhi persistent homology.
+        Spatial (distance) + electronic (VOIP) multi-parameter filtration.
+
+    **MultiParameterFiltration**:
+        Computes spectral features across spatial zones and VOIP thresholds.
+
+    **TTNNode**:
+        Tree node with Tucker decomposition for tensor contraction.
+
 Components:
     tcpnet                — TCPNet-style message passing over Enzyme-PCC
     whole_protein_tcpnet  — Multi-scale message passing over whole protein
@@ -215,6 +227,16 @@ from tope_model.memory_optimized import (
     profile_memory_usage,
     estimate_max_batch_size,
 )
+from tope_model.ttn_persistent_homology import (
+    # Configuration
+    TTNPHConfig,
+    # Tree Nodes
+    TTNNode,
+    # Filtration
+    MultiParameterFiltration,
+    # Complete TTN
+    MultiParameterTTN,
+)
 
 __all__ = [
     # Phase 3: Models
@@ -297,4 +319,9 @@ __all__ = [
     "MemoryOptimizedTrainer",
     "profile_memory_usage",
     "estimate_max_batch_size",
+    # TTN Multi-Parameter Persistent Homology
+    "TTNPHConfig",
+    "TTNNode",
+    "MultiParameterFiltration",
+    "MultiParameterTTN",
 ]
