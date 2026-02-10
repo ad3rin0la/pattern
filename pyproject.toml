@@ -86,6 +86,7 @@ Issues = "https://github.com/ad3rin0la/pattern/issues"
 [project.scripts]
 tope-train = "tope_model.trainer:main"
 tope-curate = "data_curation.pipeline:main"
+tope-ingest-topec = "data_curation.topec_ingestion:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
