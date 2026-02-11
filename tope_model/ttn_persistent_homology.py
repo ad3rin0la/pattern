@@ -535,6 +535,391 @@ class MultiParameterTTN(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Tri-Parameter Filtration with Vibrational Topology
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class TriParameterConfig(TTNPHConfig):
+    """Configuration for tri-parameter filtration (spatial × electronic × vibrational)."""
+
+    # Vibrational filtration parameters (from Chalopin's phonon topology)
+    n_vibrational_bins: int = 5  # Number of u_h threshold bins
+    use_vibrational: bool = True  # Enable vibrational axis
+
+    def __post_init__(self):
+        super().__post_init__()
+
+
+class TriParameterFiltration(MultiParameterFiltration):
+    """
+    Three-axis filtration: spatial × electronic × vibrational.
+
+    The vibrational axis uses the localization landscape u_h
+    from Chalopin's theory. Atoms enter the complex in order
+    of decreasing u_h (hotspots first).
+
+    This captures what two-axis filtration misses:
+    - Vibrationally coupled residues regardless of spatial proximity
+    - Cofactor-mediated topological bridges
+    - Stiffness gradient from active site to solvent interface
+    """
+
+    def __init__(self, cfg: TriParameterConfig):
+        super().__init__(cfg)
+        self.n_vib_bins = cfg.n_vibrational_bins
+        self.use_vibrational = cfg.use_vibrational
+
+    def compute_vibrational_filtration(
+        self,
+        u_h: torch.Tensor,
+        batch: torch.Tensor,
+        k: int = 16,
+    ) -> torch.Tensor:
+        """
+        Compute spectral features for vibrational filtration.
+
+        Atoms with highest u_h (thermal hotspots) have lowest
+        filtration value (appear first in complex construction).
+
+        Args:
+            u_h: (N,) localization amplitudes
+            batch: (N,) graph membership
+            k: Number of eigenvalues
+
+        Returns:
+            vibrational_features: (batch_size, n_vib_bins, k)
+        """
+        device = u_h.device
+        batch_size = int(batch.max().item()) + 1
+
+        # Invert: high u_h → low filtration value
+        u_max = scatter_mean(u_h, batch, dim=0)[batch]
+        filt_values = 1.0 - (u_h / (u_max + 1e-8))
+
+        # Compute quantile thresholds per graph
+        vibrational_features = []
+
+        for threshold_idx in range(self.n_vib_bins):
+            threshold = (threshold_idx + 1) / self.n_vib_bins
+
+            # Mask atoms above threshold (appear at this filtration step)
+            mask = filt_values <= threshold
+
+            # Build graph with only included atoms and compute eigenvalues
+            # (simplified: use scatter to aggregate)
+            eigenvalues = torch.zeros(batch_size, k, device=device)
+
+            for gid in range(batch_size):
+                graph_mask = (batch == gid) & mask
+                n_nodes = graph_mask.sum().item()
+
+                if n_nodes >= k:
+                    # Use u_h values as proxy for spectral features
+                    graph_u_h = u_h[graph_mask]
+                    # Sort and take top-k as "eigenvalues"
+                    sorted_vals, _ = torch.sort(graph_u_h, descending=True)
+                    eigenvalues[gid, :min(k, len(sorted_vals))] = sorted_vals[:k]
+
+            vibrational_features.append(eigenvalues)
+
+        return torch.stack(vibrational_features, dim=1)  # (batch, n_vib_bins, k)
+
+    def forward(
+        self,
+        coords: torch.Tensor,
+        batch: torch.Tensor,
+        sheaf_features: torch.Tensor,
+        u_h: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute tri-parameter persistent features.
+
+        Args:
+            coords: (N, 3) atom positions
+            batch: (N,) graph membership
+            sheaf_features: (N, feat_dim) with VOIP in column 0
+            u_h: (N,) localization landscape (optional)
+
+        Returns:
+            features: Dict with spatial, electronic, and vibrational spectral features
+        """
+        # Get spatial and electronic from parent
+        features = super().forward(coords, batch, sheaf_features)
+
+        # Add vibrational if enabled and u_h provided
+        if self.use_vibrational and u_h is not None:
+            k = self.cfg.k_eigenvalues
+            vib_features = self.compute_vibrational_filtration(u_h, batch, k)
+            features['vibrational'] = vib_features
+
+        return features
+
+
+class TriParameterTTN(nn.Module):
+    """
+    Tensor Tree Network for tri-parameter persistent homology.
+
+    Extends MultiParameterTTN with a vibrational branch based on
+    Chalopin's phonon-assisted transfer theory.
+
+    Architecture:
+        Root
+          ├─ Spatial Branch (distance zones)
+          ├─ Electronic Branch (VOIP ranges)
+          └─ Vibrational Branch (localization landscape)
+
+    The vibrational branch captures:
+    - Thermal hotspot distribution
+    - Rate-promoting vibration localization
+    - Cofactor-mediated topological bridges
+    """
+
+    def __init__(self, cfg: Optional[TriParameterConfig] = None):
+        super().__init__()
+        self.cfg = cfg or TriParameterConfig()
+
+        # Tri-parameter filtration
+        self.filtration = TriParameterFiltration(self.cfg)
+
+        # Tree structure
+        k = self.cfg.k_eigenvalues
+        rank = self.cfg.max_rank
+
+        # Spatial branch (3 zones)
+        self.spatial_leaves = nn.ModuleList([
+            TTNNode(input_dim=k, output_dim=rank, rank=0, n_children=0)
+            for _ in range(len(self.cfg.spatial_zones) + 1)
+        ])
+        self.spatial_root = TTNNode(
+            input_dim=rank,
+            output_dim=rank,
+            rank=rank,
+            n_children=len(self.spatial_leaves),
+        )
+
+        # Electronic branch (VOIP ranges)
+        self.voip_leaves = nn.ModuleList([
+            TTNNode(input_dim=k, output_dim=rank, rank=0, n_children=0)
+            for _ in range(len(self.cfg.voip_thresholds) + 1)
+        ])
+        self.voip_root = TTNNode(
+            input_dim=rank,
+            output_dim=rank,
+            rank=rank,
+            n_children=len(self.voip_leaves),
+        )
+
+        # Vibrational branch (localization landscape bins)
+        self.vibrational_leaves = nn.ModuleList([
+            TTNNode(input_dim=k, output_dim=rank, rank=0, n_children=0)
+            for _ in range(self.cfg.n_vibrational_bins)
+        ])
+        self.vibrational_root = TTNNode(
+            input_dim=rank,
+            output_dim=rank,
+            rank=rank,
+            n_children=len(self.vibrational_leaves),
+        )
+
+        # Global root (combines all three branches)
+        self.global_root = TTNNode(
+            input_dim=rank,
+            output_dim=int(rank * self.cfg.compression_ratio),
+            rank=rank,
+            n_children=3,  # Spatial + Electronic + Vibrational
+        )
+
+    def forward(
+        self,
+        coords: torch.Tensor,
+        batch: torch.Tensor,
+        sheaf_features: torch.Tensor,
+        u_h: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compress tri-parameter persistent homology into fixed-size embedding.
+
+        Args:
+            coords: (N, 3) atom coordinates
+            batch: (N,) graph membership
+            sheaf_features: (N, 8) Ioffe descriptors
+            u_h: (N,) localization landscape values
+
+        Returns:
+            compressed_features: (batch_size, compressed_dim)
+        """
+        # Compute tri-parameter filtration
+        filtration_features = self.filtration(coords, batch, sheaf_features, u_h)
+
+        # === Spatial Branch ===
+        spatial_leaf_outputs = []
+        spatial_data = filtration_features['spatial']
+        n_zones = len(self.spatial_leaves)
+        steps_per_zone = max(1, spatial_data.size(1) // n_zones)
+
+        for i, leaf in enumerate(self.spatial_leaves):
+            zone_start = i * steps_per_zone
+            zone_end = (i + 1) * steps_per_zone if i < n_zones - 1 else spatial_data.size(1)
+            zone_features = spatial_data[:, zone_start:zone_end, :].mean(dim=1)
+            spatial_leaf_outputs.append(leaf(zone_features))
+
+        spatial_output = self.spatial_root(
+            spatial_data.mean(dim=1).mean(dim=1, keepdim=True),
+            spatial_leaf_outputs
+        )
+
+        # === Electronic Branch ===
+        voip_leaf_outputs = []
+        voip_data = filtration_features['voip']
+        n_voip_ranges = len(self.voip_leaves)
+        steps_per_range = max(1, voip_data.size(1) // n_voip_ranges)
+
+        for i, leaf in enumerate(self.voip_leaves):
+            range_start = i * steps_per_range
+            range_end = (i + 1) * steps_per_range if i < n_voip_ranges - 1 else voip_data.size(1)
+            range_features = voip_data[:, range_start:range_end, :].mean(dim=1)
+            voip_leaf_outputs.append(leaf(range_features))
+
+        voip_output = self.voip_root(
+            voip_data.mean(dim=1).mean(dim=1, keepdim=True),
+            voip_leaf_outputs
+        )
+
+        # === Vibrational Branch ===
+        if 'vibrational' in filtration_features and u_h is not None:
+            vib_leaf_outputs = []
+            vib_data = filtration_features['vibrational']
+
+            for i, leaf in enumerate(self.vibrational_leaves):
+                if i < vib_data.size(1):
+                    vib_features = vib_data[:, i, :]
+                else:
+                    vib_features = vib_data[:, -1, :]
+                vib_leaf_outputs.append(leaf(vib_features))
+
+            vibrational_output = self.vibrational_root(
+                vib_data.mean(dim=1).mean(dim=1, keepdim=True),
+                vib_leaf_outputs
+            )
+        else:
+            # Fallback: use spatial output as placeholder
+            vibrational_output = torch.zeros_like(spatial_output)
+
+        # === Global Root ===
+        global_output = self.global_root(
+            torch.zeros(spatial_output.size(0), 1, device=coords.device),
+            [spatial_output, voip_output, vibrational_output]
+        )
+
+        return global_output
+
+    def get_tree_structure_info(self) -> Dict[str, int]:
+        """Return information about the tree structure."""
+        return {
+            'n_spatial_leaves': len(self.spatial_leaves),
+            'n_voip_leaves': len(self.voip_leaves),
+            'n_vibrational_leaves': len(self.vibrational_leaves),
+            'spatial_rank': self.cfg.max_rank,
+            'voip_rank': self.cfg.max_rank,
+            'vibrational_rank': self.cfg.max_rank,
+            'output_dim': int(self.cfg.max_rank * self.cfg.compression_ratio),
+            'total_parameters': sum(p.numel() for p in self.parameters()),
+        }
+
+    def ablation_forward(
+        self,
+        coords: torch.Tensor,
+        batch: torch.Tensor,
+        sheaf_features: torch.Tensor,
+        u_h: Optional[torch.Tensor] = None,
+        use_spatial: bool = True,
+        use_electronic: bool = True,
+        use_vibrational: bool = True,
+    ) -> torch.Tensor:
+        """
+        Forward pass with ablation options for each filtration axis.
+
+        Used for ablation studies to measure contribution of each axis.
+        """
+        filtration_features = self.filtration(coords, batch, sheaf_features, u_h)
+
+        branches = []
+
+        # Spatial branch
+        if use_spatial:
+            spatial_leaf_outputs = []
+            spatial_data = filtration_features['spatial']
+            n_zones = len(self.spatial_leaves)
+            steps_per_zone = max(1, spatial_data.size(1) // n_zones)
+
+            for i, leaf in enumerate(self.spatial_leaves):
+                zone_start = i * steps_per_zone
+                zone_end = (i + 1) * steps_per_zone if i < n_zones - 1 else spatial_data.size(1)
+                zone_features = spatial_data[:, zone_start:zone_end, :].mean(dim=1)
+                spatial_leaf_outputs.append(leaf(zone_features))
+
+            spatial_output = self.spatial_root(
+                spatial_data.mean(dim=1).mean(dim=1, keepdim=True),
+                spatial_leaf_outputs
+            )
+            branches.append(spatial_output)
+
+        # Electronic branch
+        if use_electronic:
+            voip_leaf_outputs = []
+            voip_data = filtration_features['voip']
+            n_voip_ranges = len(self.voip_leaves)
+            steps_per_range = max(1, voip_data.size(1) // n_voip_ranges)
+
+            for i, leaf in enumerate(self.voip_leaves):
+                range_start = i * steps_per_range
+                range_end = (i + 1) * steps_per_range if i < n_voip_ranges - 1 else voip_data.size(1)
+                range_features = voip_data[:, range_start:range_end, :].mean(dim=1)
+                voip_leaf_outputs.append(leaf(range_features))
+
+            voip_output = self.voip_root(
+                voip_data.mean(dim=1).mean(dim=1, keepdim=True),
+                voip_leaf_outputs
+            )
+            branches.append(voip_output)
+
+        # Vibrational branch
+        if use_vibrational and 'vibrational' in filtration_features:
+            vib_leaf_outputs = []
+            vib_data = filtration_features['vibrational']
+
+            for i, leaf in enumerate(self.vibrational_leaves):
+                if i < vib_data.size(1):
+                    vib_features = vib_data[:, i, :]
+                else:
+                    vib_features = vib_data[:, -1, :]
+                vib_leaf_outputs.append(leaf(vib_features))
+
+            vibrational_output = self.vibrational_root(
+                vib_data.mean(dim=1).mean(dim=1, keepdim=True),
+                vib_leaf_outputs
+            )
+            branches.append(vibrational_output)
+
+        # Combine available branches
+        if len(branches) == 0:
+            return torch.zeros(coords.size(0) // 500, int(self.cfg.max_rank * self.cfg.compression_ratio),
+                             device=coords.device)
+        elif len(branches) == 1:
+            # Single branch: project to output dim
+            return branches[0][:, :int(self.cfg.max_rank * self.cfg.compression_ratio)]
+        else:
+            # Pad to 3 branches and use global root
+            while len(branches) < 3:
+                branches.append(torch.zeros_like(branches[0]))
+
+            return self.global_root(
+                torch.zeros(branches[0].size(0), 1, device=coords.device),
+                branches
+            )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Example Usage
 # ══════════════════════════════════════════════════════════════════════════════
 

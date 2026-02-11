@@ -1285,3 +1285,203 @@ class CompletePToPEModel(nn.Module):
             )
 
         return predictions
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phonon-Aware p-Laplacian (Chalopin Integration)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PhononAwarePLaplacian(LearnablePLaplacianToPE):
+    """
+    p-Laplacian with localization landscape as initialization prior.
+
+    Rather than initializing all p-values uniformly, use the
+    localization landscape to set initial p-values proportional
+    to local vibrational confinement. Regions with high u_h
+    (thermal hotspots) start with high p (stiff), while
+    low u_h regions start with low p (floppy).
+
+    This biases learning toward the physically correct solution
+    while allowing the model to discover deviations.
+
+    The connection to Chalopin's theory:
+        p → 1: Tunneling regime (quantum effects)
+        p = 2: Standard diffusion (thermal activation)
+        p → ∞: Conformational gating (rate-limiting motion)
+
+    High u_h (thermal hotspot) → high p (stiff, small-amplitude RPVs)
+    Low u_h (cold region) → low p (floppy, large-amplitude motion)
+    """
+
+    def __init__(
+        self,
+        config: Optional[PLaplacianConfig] = None,
+        u_h_init: Optional[torch.Tensor] = None,
+        alpha: float = 2.0,
+    ):
+        """
+        Args:
+            config: p-Laplacian configuration
+            u_h_init: (N,) localization landscape for initialization
+            alpha: Range scaling (p ∈ [2, 2+alpha])
+        """
+        super().__init__(config)
+        self.alpha = alpha
+
+        if u_h_init is not None:
+            self._initialize_from_landscape(u_h_init)
+
+    def _initialize_from_landscape(self, u_h: torch.Tensor) -> None:
+        """
+        Set initial p-parameters from localization landscape.
+
+        p_init(i) = 2 + α * (u_h(i) / max(u_h))
+
+        where α controls the range of initial p-values.
+        α = 2 gives p ∈ [2, 4], matching the range where
+        Chalopin observes functional vibrational modes (0.8–4.1 THz).
+        """
+        u_h_normalized = u_h / (u_h.max() + 1e-8)
+        u_h_mean = u_h_normalized.mean().item()
+
+        # Initialize each p-parameter based on average landscape value
+        # (More sophisticated: per-cell initialization)
+        for key, param in self.p_params.items():
+            # Target p value
+            p_target = 2.0 + self.alpha * u_h_mean
+
+            # Convert to softplus parameterization: p = 2 + softplus(raw)
+            # So raw = softplus^{-1}(p - 2) = log(exp(p-2) - 1)
+            raw_target = torch.log(torch.exp(torch.tensor(p_target - 2.0)) - 1.0 + 1e-8)
+            param.data.fill_(raw_target.item())
+
+    def initialize_from_pcc(
+        self,
+        enzyme_pcc: Dict[str, Any],
+        per_cell: bool = False,
+    ) -> None:
+        """
+        Initialize p-parameters from enzyme PCC with localization landscape.
+
+        Args:
+            enzyme_pcc: Enzyme PCC containing u_h_residue or u_h_atom
+            per_cell: If True, use per-cell initialization (requires PCC structure)
+        """
+        # Get localization landscape from PCC
+        u_h = enzyme_pcc.get('u_h_residue') or enzyme_pcc.get('u_h_atom')
+        if u_h is None:
+            return  # No landscape available
+
+        if isinstance(u_h, np.ndarray):
+            u_h = torch.from_numpy(u_h).float()
+
+        if per_cell:
+            self._initialize_per_cell(u_h, enzyme_pcc)
+        else:
+            self._initialize_from_landscape(u_h)
+
+    def _initialize_per_cell(
+        self,
+        u_h: torch.Tensor,
+        enzyme_pcc: Dict[str, Any],
+    ) -> None:
+        """
+        Initialize p-parameters per cell based on local u_h.
+
+        This gives spatially varying p-values that reflect
+        the local vibrational character.
+        """
+        # For now, use rank-based averaging
+        # Could be extended to true per-cell initialization
+
+        # Rank 0: atom-level
+        u_h_rank0 = enzyme_pcc.get('u_h_rank0')
+        if u_h_rank0 is not None:
+            u_h_mean_0 = np.mean(u_h_rank0) if isinstance(u_h_rank0, np.ndarray) else u_h_rank0.mean().item()
+        else:
+            u_h_mean_0 = u_h.mean().item()
+
+        # Rank 1: bond-level (typically lower u_h for stiff bonds)
+        u_h_rank1 = enzyme_pcc.get('u_h_rank1')
+        if u_h_rank1 is not None:
+            u_h_mean_1 = np.mean(u_h_rank1) if isinstance(u_h_rank1, np.ndarray) else u_h_rank1.mean().item()
+        else:
+            u_h_mean_1 = u_h_mean_0 * 0.8  # Heuristic
+
+        # Rank 2: cluster-level (intermediate)
+        u_h_rank2 = enzyme_pcc.get('u_h_rank2')
+        if u_h_rank2 is not None:
+            u_h_mean_2 = np.mean(u_h_rank2) if isinstance(u_h_rank2, np.ndarray) else u_h_rank2.mean().item()
+        else:
+            u_h_mean_2 = u_h_mean_0 * 0.9  # Heuristic
+
+        rank_means = {0: u_h_mean_0, 1: u_h_mean_1, 2: u_h_mean_2}
+
+        # Normalize
+        max_mean = max(rank_means.values()) + 1e-8
+
+        for key, param in self.p_params.items():
+            # Parse rank from key (assumes format like "rank0_radius0")
+            rank = self._parse_rank_from_key(key)
+            u_h_val = rank_means.get(rank, u_h_mean_0) / max_mean
+
+            p_target = 2.0 + self.alpha * u_h_val
+            raw_target = torch.log(torch.exp(torch.tensor(p_target - 2.0)) - 1.0 + 1e-8)
+            param.data.fill_(raw_target.item())
+
+    def _parse_rank_from_key(self, key: str) -> int:
+        """Parse rank from parameter key."""
+        import re
+        match = re.search(r'rank(\d+)', key)
+        if match:
+            return int(match.group(1))
+        return 0
+
+    def landscape_correlation_loss(
+        self,
+        enzyme_pcc: Dict[str, Any],
+    ) -> torch.Tensor:
+        """
+        Compute loss encouraging p-values to correlate with u_h.
+
+        This is a regularization term that can be added to the
+        training loss to maintain physical consistency.
+        """
+        u_h = enzyme_pcc.get('u_h_residue')
+        if u_h is None:
+            return torch.tensor(0.0, device=self.device)
+
+        if isinstance(u_h, np.ndarray):
+            u_h = torch.from_numpy(u_h).float().to(self.device)
+
+        # Get current p-values (averaged across cells)
+        p_values = []
+        for param in self.p_params.values():
+            p = 2.0 + F.softplus(param)
+            p_values.append(p.mean())
+
+        if not p_values:
+            return torch.tensor(0.0, device=self.device)
+
+        p_mean = torch.stack(p_values).mean()
+
+        # Correlation: high u_h should give high p
+        u_h_normalized = (u_h - u_h.mean()) / (u_h.std() + 1e-8)
+        p_normalized = (p_mean - 2.0) / (self.alpha + 1e-8)
+
+        # Simple correlation proxy (could be more sophisticated)
+        correlation = u_h_normalized.mean() * p_normalized
+
+        # Loss: encourage positive correlation
+        return 1.0 - correlation
+
+    @property
+    def device(self):
+        """Get device of parameters."""
+        for param in self.parameters():
+            return param.device
+        return torch.device('cpu')
+
+
+# Import numpy for the class above
+import numpy as np
