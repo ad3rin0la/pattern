@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Set
 
 import requests
 
-from data_curation.config import (
+from tope.data.config import (
     PDB_DIR,
     RCSB_DATA_URL,
     RCSB_DOWNLOAD_URL,

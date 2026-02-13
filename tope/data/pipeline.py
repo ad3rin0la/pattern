@@ -12,7 +12,7 @@ Ties together:
 Usage
 -----
     from data_curation import CurationPipeline
-    from data_curation.config import PipelineConfig
+    from tope.data.config import PipelineConfig
 
     config = PipelineConfig(min_structures=5000, max_resolution=2.5)
     pipeline = CurationPipeline(config)
@@ -31,23 +31,23 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from data_curation.active_site import ActiveSite, ActiveSiteExtractor
-from data_curation.config import (
+from tope.data.active_site import ActiveSite, ActiveSiteExtractor
+from tope.data.config import (
     DATA_ROOT,
     FEATURES_DIR,
     PDB_DIR,
     PROCESSED_DIR,
     PipelineConfig,
 )
-from data_curation.dataset import DatasetBuilder, DatasetRecord
-from data_curation.features import ActiveSiteFeatures, FeatureComputer
-from data_curation.kinetics_client import (
+from tope.data.dataset import DatasetBuilder, DatasetRecord
+from tope.data.features import ActiveSiteFeatures, FeatureComputer
+from tope.data.kinetics_client import (
     KineticsAggregator,
     KineticEntry,
     KineticsSummary,
 )
-from data_curation.mcsa_client import MCSAClient, MCSAEntry
-from data_curation.pdb_client import PDBClient
+from tope.data.mcsa_client import MCSAClient, MCSAEntry
+from tope.data.pdb_client import PDBClient
 
 logger = logging.getLogger(__name__)
 

@@ -21,11 +21,11 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-from data_curation.config import (
+from tope.data.config import (
     DEFAULT_ACTIVE_SITE_RADIUS,
     PipelineConfig,
 )
-from data_curation.mcsa_client import CatalyticResidue
+from tope.data.mcsa_client import CatalyticResidue
 
 logger = logging.getLogger(__name__)
 

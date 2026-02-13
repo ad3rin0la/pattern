@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 
-from data_curation.config import (
+from tope.data.config import (
     KINETICS_DIR,
     KINETICS_PARAM_TYPES,
     SABIO_RK_API_URL,

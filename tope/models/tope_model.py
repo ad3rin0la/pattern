@@ -15,8 +15,8 @@ Two model variants:
 
 Usage
 -----
-    from tope_model import ToPEModel, ToPEConfig
-    from tope_model.tope_model import CompleteToPEModel, CompleteToPEConfig
+    from tope.models import ToPEModel, ToPEConfig
+    from tope.models import CompleteToPEModel, CompleteToPEConfig
 
     # Active-site only
     model = ToPEModel(ToPEConfig())
@@ -33,18 +33,18 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from tope_model.tcpnet import EnzymeTCPNet, TCPNetConfig, GlobalAttentionPooling
-from tope_model.cross_attention import (
+from tope.models.tcpnet import EnzymeTCPNet, TCPNetConfig, GlobalAttentionPooling
+from tope.models.cross_attention import (
     SubstrateProductCrossAttention,
     CrossAttentionConfig,
 )
-from tope_model.task_heads import (
+from tope.models.task_heads import (
     MultiTaskHeads,
     TaskHeadsConfig,
     WholeProteinTaskHeads,
     DistantMutationEffectPredictor,
 )
-from tope_model.whole_protein_tcpnet import WholeProteinTCPNet, WholeProteinConfig
+from tope.models.whole_protein_tcpnet import WholeProteinTCPNet, WholeProteinConfig
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────

@@ -37,7 +37,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tope_model.tcpnet import GaussianRBF, CosineCutoff
+from tope.models.tcpnet import GaussianRBF, CosineCutoff
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
