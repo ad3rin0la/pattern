@@ -6,7 +6,6 @@ A deep learning architecture for enzyme function prediction using persistent hom
 
 ToPE combines topological data analysis with SE(3)-equivariant neural networks to predict enzyme properties:
 
-- **EC Classification**: Hierarchical enzyme class prediction
 - **Substrate Selectivity**: Multi-label substrate/product prediction
 - **Kinetic Parameters**: k_cat, K_M, and k_cat/K_M regression
 - **Mutation Effects**: ΔΔG and activity change prediction
