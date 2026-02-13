@@ -1,17 +1,15 @@
 """
-Active-site extraction from PDB structures.
+Residue-level active-site validation from PDB structures.
 
-Given a structure file and a list of catalytic residue annotations (from M-CSA),
-extract the local atomic environment around the active site. The extraction
-radius mirrors the filtration shell used in the topology bridge:
+Given a structure file and M-CSA catalytic residue annotations,
+validate that annotated residues exist in the structure and record
+the residue-level environment. The combinatorial complex (Phase 2)
+handles atom decomposition — curation just needs to confirm residues
+are present and record their positions.
 
-    ε = 2 Å  → covalent skeleton
-    ε = 4 Å  → H-bond network / catalytic triad
-    ε = 6 Å  → active-site pocket / substrate cavity
-    ε = 8 Å  → allosteric shell / distal residues
-
-We extract at the largest radius (default 8 Å) so downstream filtration
-can sweep through all scales.
+Replaces the atom-level ActiveSiteExtractor with a residue-level
+approach that avoids the chain-ID mismatch problem entirely by
+trying both label and auth chain IDs for CIF files.
 """
 
 from __future__ import annotations
@@ -24,7 +22,6 @@ from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 
 from data_curation.config import (
-    CATALYTIC_RESIDUE_PADDING,
     DEFAULT_ACTIVE_SITE_RADIUS,
     PipelineConfig,
 )
@@ -32,38 +29,28 @@ from data_curation.mcsa_client import CatalyticResidue
 
 logger = logging.getLogger(__name__)
 
-# BioPython imports — optional but expected for production use.
 try:
-    from Bio.PDB import MMCIFParser, PDBParser, NeighborSearch, Selection
+    from Bio.PDB import MMCIFParser, PDBParser
     from Bio.PDB.Structure import Structure
-    from Bio.PDB.Residue import Residue as BioResidue
-    from Bio.PDB.Atom import Atom as BioAtom
     HAS_BIOPYTHON = True
 except ImportError:
     HAS_BIOPYTHON = False
-    logger.warning(
-        "BioPython not installed — active-site extraction will be unavailable. "
-        "Install with: pip install biopython"
-    )
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
-class AtomRecord:
-    """Minimal atom representation for downstream feature computation."""
+class ResidueRecord:
+    """One residue in the active-site environment."""
 
-    serial: int
-    name: str               # atom name, e.g. "CA", "NZ", "FE"
-    element: str             # element symbol, e.g. "C", "N", "FE"
-    residue_name: str        # three-letter code
-    residue_number: int
-    chain_id: str
-    coord: np.ndarray        # shape (3,), Cartesian coordinates in Å
-    occupancy: float = 1.0
-    b_factor: float = 0.0
-    is_hetero: bool = False
+    chain_id: str            # auth chain ID
+    residue_name: str        # three-letter code (e.g. HIS, ASP)
+    residue_number: int      # auth residue number
+    ca_coord: np.ndarray     # Cα coordinate (3,), or residue centroid if no Cα
+    mean_b_factor: float = 0.0
+    n_atoms: int = 0
     is_catalytic: bool = False
+    role: str = ""           # M-CSA role if catalytic
 
     @property
     def residue_id(self) -> str:
@@ -72,58 +59,40 @@ class AtomRecord:
 
 @dataclass
 class ActiveSite:
-    """Extracted active-site environment."""
+    """Validated active-site environment at residue level."""
 
     pdb_id: str
-    atoms: List[AtomRecord] = field(default_factory=list)
+    residues: List[ResidueRecord] = field(default_factory=list)
     catalytic_residue_ids: Set[str] = field(default_factory=set)
-    centroid: Optional[np.ndarray] = None       # geometric centre of catalytic atoms
+    centroid: Optional[np.ndarray] = None
     radius_used: float = DEFAULT_ACTIVE_SITE_RADIUS
     ec_number: str = ""
 
     @property
-    def n_atoms(self) -> int:
-        return len(self.atoms)
-
-    @property
     def n_residues(self) -> int:
-        return len({a.residue_id for a in self.atoms})
+        return len(self.residues)
 
     @property
     def n_catalytic_residues(self) -> int:
         return len(self.catalytic_residue_ids)
 
     @property
-    def elements(self) -> Set[str]:
-        return {a.element for a in self.atoms}
+    def n_atoms(self) -> int:
+        return sum(r.n_atoms for r in self.residues)
 
-    @property
-    def has_metal(self) -> bool:
-        metals = {"FE", "ZN", "CU", "MN", "MG", "CA", "CO", "NI", "MO", "W"}
-        return bool(self.elements & metals)
-
-    def coords_array(self) -> np.ndarray:
-        """Return (N, 3) coordinate matrix."""
-        return np.array([a.coord for a in self.atoms])
-
-    def distance_matrix(self) -> np.ndarray:
-        """Pairwise Euclidean distance matrix (N, N)."""
-        coords = self.coords_array()
-        diff = coords[:, None, :] - coords[None, :, :]
-        return np.sqrt((diff ** 2).sum(axis=-1))
+    def ca_coords_array(self) -> np.ndarray:
+        """Return (N, 3) Cα coordinate matrix."""
+        return np.array([r.ca_coord for r in self.residues])
 
 
 # ── Extractor ─────────────────────────────────────────────────────────────────
 
 class ActiveSiteExtractor:
-    """Extract active-site atomic environments from PDB/mmCIF files."""
+    """Validate and extract residue-level active-site environments."""
 
     def __init__(self, config: Optional[PipelineConfig] = None):
         if not HAS_BIOPYTHON:
-            raise ImportError(
-                "BioPython is required for active-site extraction. "
-                "Install with: pip install biopython"
-            )
+            raise ImportError("BioPython required: pip install biopython")
         self.config = config or PipelineConfig()
         self._cif_parser = MMCIFParser(QUIET=True)
         self._pdb_parser = PDBParser(QUIET=True)
@@ -136,174 +105,146 @@ class ActiveSiteExtractor:
         ec_number: str = "",
         radius: Optional[float] = None,
     ) -> Optional[ActiveSite]:
-        """Extract the active-site environment around catalytic residues.
+        """Validate catalytic residues and extract residue-level environment.
 
         Parameters
         ----------
-        structure_path : Path
-            Path to a .cif or .pdb file.
-        catalytic_residues : list of CatalyticResidue
-            Annotated catalytic residues from M-CSA.
-        pdb_id : str
-            PDB identifier (for labelling).
-        ec_number : str
-            EC classification string.
-        radius : float, optional
-            Extraction radius in Å. Defaults to config.active_site_radius.
+        structure_path : Path to .cif or .pdb file
+        catalytic_residues : M-CSA annotations
+        pdb_id : PDB identifier
+        ec_number : EC classification
+        radius : extraction radius in Å (default from config)
 
         Returns
         -------
-        ActiveSite or None
-            Extracted environment, or None if parsing/extraction fails.
+        ActiveSite with residue-level records, or None on failure.
         """
         if radius is None:
             radius = self.config.active_site_radius
 
-        # Parse structure
         structure = self._parse_structure(structure_path, pdb_id)
         if structure is None:
             return None
 
-        # Build a set of (chain_id, resnum) for catalytic residues
+        # Build residue lookup: (chain_id, resnum) → residue info
+        # For CIF files, index by BOTH label and auth chain IDs
+        is_cif = structure_path.suffix.lower() in ('.cif', '.mmcif')
+        residue_lookup, auth_map = self._build_residue_lookup(
+            structure, structure_path, is_cif
+        )
+
+        # M-CSA uses auth chain IDs — build the target set
         cat_keys: Set[Tuple[str, int]] = set()
+        cat_roles: Dict[Tuple[str, int], str] = {}
         for cr in catalytic_residues:
-            cat_keys.add((cr.chain_id, cr.residue_number))
+            key = (cr.chain_id, cr.residue_number)
+            cat_keys.add(key)
+            cat_roles[key] = cr.role
 
-        # Find catalytic atoms to compute centroid
-        cat_atoms: List[BioAtom] = []
-        all_atoms: List[BioAtom] = list(structure.get_atoms())
+        # Match catalytic residues against structure
+        matched_cat: List[Tuple[str, int]] = []
+        for key in cat_keys:
+            if key in residue_lookup:
+                matched_cat.append(key)
+            elif is_cif:
+                # Try mapping auth → label chain ID
+                auth_chain, resnum = key
+                label_chain = auth_map.get(auth_chain)
+                if label_chain and (label_chain, resnum) in residue_lookup:
+                    matched_cat.append((label_chain, resnum))
+                    # Update the role mapping for the label chain ID
+                    cat_roles[(label_chain, resnum)] = cat_roles[key]
+                else:
+                    # Last resort: match by resnum across all chains
+                    for (c, r), _ in residue_lookup.items():
+                        if r == resnum:
+                            matched_cat.append((c, r))
+                            cat_roles[(c, r)] = cat_roles[key]
+                            break
 
-        for atom in all_atoms:
-            res = atom.get_parent()
-            chain = res.get_parent()
-            if chain is not None:
-                chain_id = chain.get_id()
-                resnum = res.get_id()[1]
-                if (chain_id, resnum) in cat_keys:
-                    cat_atoms.append(atom)
-
-        if not cat_atoms:
+        if not matched_cat:
             logger.warning(
-                "%s: no catalytic atoms found for annotated residues %s",
-                pdb_id, cat_keys,
+                "%s: no catalytic residues matched in structure "
+                "(tried %d M-CSA residues, structure has %d residues)",
+                pdb_id, len(cat_keys), len(residue_lookup),
             )
-            # Fall back: try matching just by residue number across all chains
-            cat_resnums = {rn for _, rn in cat_keys}
-            for atom in all_atoms:
-                res = atom.get_parent()
-                if res.get_id()[1] in cat_resnums:
-                    cat_atoms.append(atom)
-
-            if not cat_atoms:
-                logger.warning("%s: fallback also failed — skipping", pdb_id)
-                return None
-
-        # Compute centroid of catalytic atoms
-        cat_coords = np.array([a.get_vector().get_array() for a in cat_atoms])
-        centroid = cat_coords.mean(axis=0)
-
-        # Neighbour search: find all atoms within radius of centroid
-        ns = NeighborSearch(all_atoms)
-        nearby_atoms = ns.search(centroid, radius + CATALYTIC_RESIDUE_PADDING, level="A")
-
-        if not nearby_atoms:
-            logger.warning("%s: no atoms within %.1f Å of centroid", pdb_id, radius)
             return None
 
-        # Build AtomRecord list
-        cat_residue_ids: Set[str] = set()
-        records: List[AtomRecord] = []
+        if len(matched_cat) < len(cat_keys):
+            logger.info(
+                "%s: matched %d / %d catalytic residues",
+                pdb_id, len(matched_cat), len(cat_keys),
+            )
 
-        for atom in nearby_atoms:
-            res: BioResidue = atom.get_parent()
-            chain = res.get_parent()
-            if chain is None:
+        # Compute centroid from catalytic residue Cα positions
+        cat_coords = []
+        for key in matched_cat:
+            info = residue_lookup[key]
+            cat_coords.append(info["ca_coord"])
+        centroid = np.mean(cat_coords, axis=0)
+
+        # Collect all residues within radius
+        matched_set = set(matched_cat)
+        records: List[ResidueRecord] = []
+        cat_ids: Set[str] = set()
+
+        for key, info in residue_lookup.items():
+            dist = np.linalg.norm(info["ca_coord"] - centroid)
+            if dist > radius:
                 continue
 
-            chain_id = chain.get_id()
-            het_flag = res.get_id()[0]
-            resnum = res.get_id()[1]
-            resname = res.get_resname().strip()
-
-            is_hetero = het_flag.strip() != ""
-            is_water = resname in ("HOH", "WAT", "DOD")
-
-            # Skip water unless configured to include it
-            if is_water and not self.config.include_water:
-                continue
-
-            # Skip non-standard heteroatoms unless configured
-            if is_hetero and not is_water and not self.config.include_heteroatoms:
-                continue
-
-            is_cat = (chain_id, resnum) in cat_keys
-            res_id = f"{chain_id}:{resname}{resnum}"
-            if is_cat:
-                cat_residue_ids.add(res_id)
-
-            element = atom.element.strip().upper() if atom.element else atom.get_name().strip()[0]
-
-            records.append(AtomRecord(
-                serial=atom.get_serial_number(),
-                name=atom.get_name(),
-                element=element,
-                residue_name=resname,
-                residue_number=resnum,
-                chain_id=chain_id,
-                coord=np.array(atom.get_vector().get_array(), dtype=np.float64),
-                occupancy=atom.get_occupancy(),
-                b_factor=atom.get_bfactor(),
-                is_hetero=is_hetero,
+            is_cat = key in matched_set
+            rec = ResidueRecord(
+                chain_id=key[0],
+                residue_name=info["resname"],
+                residue_number=key[1],
+                ca_coord=info["ca_coord"],
+                mean_b_factor=info["mean_b"],
+                n_atoms=info["n_atoms"],
                 is_catalytic=is_cat,
-            ))
+                role=cat_roles.get(key, ""),
+            )
+            records.append(rec)
+            if is_cat:
+                cat_ids.add(rec.residue_id)
 
-        active_site = ActiveSite(
+        site = ActiveSite(
             pdb_id=pdb_id,
-            atoms=records,
-            catalytic_residue_ids=cat_residue_ids,
+            residues=records,
+            catalytic_residue_ids=cat_ids,
             centroid=centroid,
             radius_used=radius,
             ec_number=ec_number,
         )
 
         logger.debug(
-            "%s: extracted %d atoms (%d residues, %d catalytic) within %.1f Å",
-            pdb_id, active_site.n_atoms, active_site.n_residues,
-            active_site.n_catalytic_residues, radius,
+            "%s: %d residues within %.1f Å (%d catalytic)",
+            pdb_id, site.n_residues, radius, site.n_catalytic_residues,
         )
-        return active_site
+        return site
+
+    # ── Batch extraction ─────────────────────────────────────────────────
 
     def extract_batch(
         self,
         entries: List[Dict],
         structure_dir: Path,
-        fmt: str = "cif",
+        fmt: str = "pdb",
     ) -> List[ActiveSite]:
-        """Extract active sites for a batch of entries.
-
-        Parameters
-        ----------
-        entries : list of dict
-            Each dict must have keys: "pdb_id", "catalytic_residues", "ec_number".
-        structure_dir : Path
-            Directory containing downloaded structure files.
-        fmt : str
-            File format extension ("cif" or "pdb").
-
-        Returns
-        -------
-        list of ActiveSite
-        """
+        """Extract active sites for a batch of entries."""
         results: List[ActiveSite] = []
         total = len(entries)
 
         for i, entry in enumerate(entries, 1):
             pdb_id = entry["pdb_id"]
-            ext = ".cif" if fmt == "cif" else ".pdb"
-            path = structure_dir / f"{pdb_id}{ext}"
+
+            # Try both formats
+            path = structure_dir / f"{pdb_id}.{fmt}"
+            if not path.exists():
+                alt_fmt = "cif" if fmt == "pdb" else "pdb"
+                path = structure_dir / f"{pdb_id}.{alt_fmt}"
 
             if not path.exists():
-                logger.warning("%s: structure file not found at %s", pdb_id, path)
                 continue
 
             site = self.extract(
@@ -317,61 +258,101 @@ class ActiveSiteExtractor:
                 results.append(site)
 
             if i % 100 == 0 or i == total:
-                logger.info("Extracted active sites: %d / %d (%d OK)", i, total, len(results))
+                logger.info("Active sites: %d / %d (%d OK)", i, total, len(results))
 
-        logger.info(
-            "Active-site extraction complete: %d / %d structures processed",
-            len(results), total,
-        )
+        logger.info("Done: %d / %d structures", len(results), total)
         return results
-
-    # ── Geometry helpers ─────────────────────────────────────────────────
-
-    @staticmethod
-    def compute_adjacency(
-        active_site: ActiveSite,
-        threshold: float,
-    ) -> np.ndarray:
-        """Binary adjacency matrix at a given distance threshold.
-
-        This is one filtration step: atoms within `threshold` Å are connected.
-        Sweeping threshold across FILTRATION_RADII produces the filtration
-        used by persistent Laplacians downstream.
-        """
-        dist = active_site.distance_matrix()
-        return (dist <= threshold).astype(np.int32)
-
-    @staticmethod
-    def compute_filtration_adjacencies(
-        active_site: ActiveSite,
-        radii: Optional[List[float]] = None,
-    ) -> Dict[float, np.ndarray]:
-        """Adjacency matrices at each filtration radius.
-
-        Returns
-        -------
-        dict mapping radius (float) → adjacency matrix (N, N)
-        """
-        if radii is None:
-            from data_curation.config import FILTRATION_RADII
-            radii = FILTRATION_RADII
-
-        dist = active_site.distance_matrix()
-        return {r: (dist <= r).astype(np.int32) for r in radii}
 
     # ── Private ──────────────────────────────────────────────────────────
 
-    def _parse_structure(
-        self,
-        path: Path,
-        pdb_id: str = "",
-    ) -> Optional[Structure]:
-        """Parse a structure file (mmCIF or PDB)."""
+    def _parse_structure(self, path: Path, pdb_id: str = "") -> Optional[Structure]:
+        """Parse a structure file."""
         try:
-            if path.suffix.lower() == ".cif":
-                return self._cif_parser.get_structure(pdb_id, str(path))
+            if path.suffix.lower() in ('.cif', '.mmcif'):
+                return self._cif_parser.get_structure(pdb_id or "X", str(path))
             else:
-                return self._pdb_parser.get_structure(pdb_id, str(path))
+                return self._pdb_parser.get_structure(pdb_id or "X", str(path))
         except Exception as exc:
-            logger.warning("Failed to parse %s: %s", path, exc)
+            logger.warning("%s: parse failed: %s", pdb_id, exc)
             return None
+
+    def _build_residue_lookup(
+        self,
+        structure: Structure,
+        path: Path,
+        is_cif: bool,
+    ) -> Tuple[Dict[Tuple[str, int], dict], Dict[str, str]]:
+        """Build (chain_id, resnum) → residue info lookup.
+
+        For CIF files, also builds auth_chain → label_chain mapping
+        by reading the mmCIF dict directly.
+
+        Returns
+        -------
+        residue_lookup : dict mapping (chain, resnum) → info dict
+        auth_map : dict mapping auth_chain_id → label_chain_id
+        """
+        residue_lookup: Dict[Tuple[str, int], dict] = {}
+        auth_map: Dict[str, str] = {}
+
+        # Build auth → label chain map for CIF
+        if is_cif:
+            try:
+                from Bio.PDB.MMCIF2Dict import MMCIF2Dict
+                mmcif_dict = MMCIF2Dict(str(path))
+                label_chains = mmcif_dict.get("_atom_site.label_asym_id", [])
+                auth_chains = mmcif_dict.get("_atom_site.auth_asym_id", [])
+                for lc, ac in zip(label_chains, auth_chains):
+                    if ac not in auth_map:
+                        auth_map[ac] = lc
+            except Exception:
+                pass  # Fall back to BioPython chain IDs
+
+        # Iterate structure residues
+        model = structure[0]
+        for chain in model:
+            chain_id = chain.get_id()
+            for residue in chain:
+                het_flag = residue.get_id()[0]
+                if het_flag.strip() not in ("", "H_MSE"):
+                    continue  # skip water and most heteroatoms
+
+                resnum = residue.get_id()[1]
+                resname = residue.get_resname().strip()
+
+                # Get Cα coord, or residue centroid if no Cα
+                atoms = list(residue.get_atoms())
+                if not atoms:
+                    continue
+
+                ca_coord = None
+                for atom in atoms:
+                    if atom.get_name() == "CA":
+                        ca_coord = np.array(atom.get_vector().get_array(), dtype=np.float64)
+                        break
+
+                if ca_coord is None:
+                    coords = [a.get_vector().get_array() for a in atoms]
+                    ca_coord = np.mean(coords, axis=0).astype(np.float64)
+
+                b_factors = [a.get_bfactor() for a in atoms]
+                mean_b = float(np.mean(b_factors)) if b_factors else 0.0
+
+                key = (chain_id, resnum)
+                residue_lookup[key] = {
+                    "resname": resname,
+                    "ca_coord": ca_coord,
+                    "mean_b": mean_b,
+                    "n_atoms": len(atoms),
+                }
+
+        return residue_lookup, auth_map
+
+    # ── Geometry helpers (for compatibility) ──────────────────────────────
+
+    @staticmethod
+    def compute_ca_distance_matrix(site: ActiveSite) -> np.ndarray:
+        """Pairwise Cα distance matrix (N_res, N_res)."""
+        coords = site.ca_coords_array()
+        diff = coords[:, None, :] - coords[None, :, :]
+        return np.sqrt((diff ** 2).sum(axis=-1))

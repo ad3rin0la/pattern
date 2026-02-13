@@ -27,6 +27,11 @@ Usage:
 from data_curation.pipeline import CurationPipeline
 from data_curation.config import CurationConfig
 from data_curation.kinetics_client import KineticsAggregator
+from data_curation.active_site import (
+    ResidueRecord,
+    ActiveSite,
+    ActiveSiteExtractor,
+)
 from data_curation.topec_ingestion import (
     IngestionConfig,
     ToPERecord,
@@ -49,6 +54,10 @@ __all__ = [
     "CurationPipeline",
     "CurationConfig",
     "KineticsAggregator",
+    # Active site extraction (residue-level)
+    "ResidueRecord",
+    "ActiveSite",
+    "ActiveSiteExtractor",
     # TopEC ingestion
     "IngestionConfig",
     "ToPERecord",
