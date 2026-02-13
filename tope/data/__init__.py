@@ -1,6 +1,6 @@
 """
-ToPE Data Curation Pipeline
-============================
+ToPE Data Pipeline
+==================
 Curate enzyme active-site datasets from M-CSA + PDB + BRENDA/SABIO-RK
 for topological pattern recognition in enzyme catalysis.
 
@@ -11,28 +11,26 @@ Supports multiple data sources:
     - TopEC: Pre-curated enzyme classification dataset
 
 Usage:
-    from data_curation import CurationPipeline, CurationConfig
+    from tope.data import CurationPipeline, CurationConfig
 
     config = CurationConfig(output_dir="./data")
     pipeline = CurationPipeline(config)
     dataset = pipeline.run()
-
-    # Or ingest from TopEC dataset:
-    from data_curation import run_ingestion, IngestionConfig
-
-    cfg = IngestionConfig(topec_csv_dir="TopEC/data/csv")
-    records = run_ingestion(cfg)
 """
 
-from data_curation.pipeline import CurationPipeline
-from data_curation.config import CurationConfig
-from data_curation.kinetics_client import KineticsAggregator
-from data_curation.active_site import (
+from tope.data.pipeline import CurationPipeline
+from tope.data.config import CurationConfig, PipelineConfig
+from tope.data.kinetics_client import KineticsAggregator
+from tope.data.active_site import (
     ResidueRecord,
     ActiveSite,
     ActiveSiteExtractor,
 )
-from data_curation.topec_ingestion import (
+from tope.data.mcsa_client import MCSAClient, MCSAEntry, CatalyticResidue
+from tope.data.pdb_client import PDBClient
+from tope.data.features import FeatureComputer, ActiveSiteFeatures
+from tope.data.dataset import DatasetBuilder, DatasetRecord
+from tope.data.topec_ingestion import (
     IngestionConfig,
     ToPERecord,
     KineticsRecord,
@@ -53,11 +51,23 @@ __all__ = [
     # Core pipeline
     "CurationPipeline",
     "CurationConfig",
+    "PipelineConfig",
     "KineticsAggregator",
-    # Active site extraction (residue-level)
+    # Active site extraction
     "ResidueRecord",
     "ActiveSite",
     "ActiveSiteExtractor",
+    # Data sources
+    "MCSAClient",
+    "MCSAEntry",
+    "CatalyticResidue",
+    "PDBClient",
+    # Features
+    "FeatureComputer",
+    "ActiveSiteFeatures",
+    # Dataset
+    "DatasetBuilder",
+    "DatasetRecord",
     # TopEC ingestion
     "IngestionConfig",
     "ToPERecord",

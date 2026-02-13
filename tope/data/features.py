@@ -21,8 +21,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from data_curation.active_site import ActiveSite, AtomRecord
-from data_curation.config import (
+from tope.data.active_site import ActiveSite, AtomRecord
+from tope.data.config import (
     ELEMENT_PROPERTIES,
     IOFFE_PROPERTY_KEYS,
     RESIDUE_PROPERTIES,

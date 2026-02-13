@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Set
 
 import requests
 
-from data_curation.config import (
+from tope.data.config import (
     MCSA_CSV_URL,
     MCSA_DIR,
     MCSA_ENTRIES_URL,

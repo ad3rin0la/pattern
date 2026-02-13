@@ -3,19 +3,31 @@
 import pytest
 
 
-def test_import_tope_model():
-    """Test importing main tope_model package."""
-    import tope_model
+def test_import_tope_package():
+    """Test importing top-level tope package."""
+    import tope
 
-    # Check key classes are exported
-    assert hasattr(tope_model, 'ToPEModel')
-    assert hasattr(tope_model, 'ToPEConfig')
-    assert hasattr(tope_model, 'ToPETrainer')
+    assert hasattr(tope, '__version__')
+    assert hasattr(tope, 'ToPEModel')
+    assert hasattr(tope, 'ToPEConfig')
+    assert hasattr(tope, 'ToPETrainer')
+
+
+def test_import_models():
+    """Test importing model components."""
+    from tope.models import (
+        ToPEModel,
+        ToPEConfig,
+        CompleteToPEModel,
+        CompleteToPEConfig,
+        EnzymeTCPNet,
+        TCPNetLayer,
+    )
 
 
 def test_import_memory_optimized():
     """Test importing memory-optimized components."""
-    from tope_model import (
+    from tope.models import (
         MemoryOptimizedToPE,
         MemoryOptimizedConfig,
         MemoryOptimizedTrainer,
@@ -27,7 +39,7 @@ def test_import_memory_optimized():
 
 def test_import_ttn():
     """Test importing TTN persistent homology."""
-    from tope_model import (
+    from tope.topology import (
         MultiParameterTTN,
         TTNPHConfig,
         MultiParameterFiltration,
@@ -37,7 +49,7 @@ def test_import_ttn():
 
 def test_import_multi_subunit():
     """Test importing multi-subunit components."""
-    from tope_model import (
+    from tope.models import (
         MultiSubunitToPEModel,
         MultiSubunitToPEConfig,
         MultiSubunitPCCBuilder,
@@ -47,7 +59,7 @@ def test_import_multi_subunit():
 
 def test_import_p_laplacian():
     """Test importing p-Laplacian components."""
-    from tope_model import (
+    from tope.models import (
         CompletePToPEModel,
         LearnablePLaplacianToPE,
         MechanisticAnalyzer,
@@ -57,7 +69,7 @@ def test_import_p_laplacian():
 
 def test_import_attribution():
     """Test importing attribution components."""
-    from tope_model import (
+    from tope.attribution import (
         MultiScaleAttributionAnalyzer,
         StratifiedOODValidator,
         AttributionVisualizer,
@@ -66,7 +78,7 @@ def test_import_attribution():
 
 def test_import_mcp_adapters():
     """Test importing MCP adapters."""
-    from tope_model import (
+    from tope.utils import (
         MCPAdapter,
         AlphaFoldMCPAdapter,
         ChEMBLMCPAdapter,
@@ -75,10 +87,54 @@ def test_import_mcp_adapters():
     )
 
 
-def test_import_data_curation():
+def test_import_data():
     """Test importing data curation package."""
-    import data_curation
+    from tope.data import (
+        CurationPipeline,
+        CurationConfig,
+        MCSAClient,
+        PDBClient,
+        ActiveSiteExtractor,
+    )
 
-    # Check key classes are exported
-    assert hasattr(data_curation, 'CurationPipeline')
-    assert hasattr(data_curation, 'CurationConfig')
+
+def test_import_training():
+    """Test importing training components."""
+    from tope.training import (
+        ToPETrainer,
+        MultiTaskLoss,
+        EnhancedMultiTaskLoss,
+        MetricAccumulator,
+    )
+
+
+def test_import_topology():
+    """Test importing topology components."""
+    from tope.topology import (
+        HodgeLaplacianENM,
+        SheafENM,
+        TransferPathwayHead,
+        TriParameterTTN,
+    )
+
+
+def test_import_phonon():
+    """Test importing phonon topology components."""
+    from tope.topology import (
+        compute_localization_landscape,
+        identify_thermal_hotspots,
+        build_cofactor_3cells,
+        PhononTopologyFeatures,
+    )
+
+
+def test_import_transfer_pathways():
+    """Test importing transfer pathway components."""
+    from tope.topology import (
+        PathwayType,
+        TransferPathwayConfig,
+        TransferPathwayHead,
+        TransferPathwayLoss,
+        TransferPathwayVisualizer,
+        extract_transfer_pathway_graph,
+    )

@@ -22,9 +22,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from data_curation.active_site import ActiveSite
-from data_curation.config import EC_TOP_LEVEL, PROCESSED_DIR, FEATURES_DIR, PipelineConfig
-from data_curation.features import ActiveSiteFeatures
+from tope.data.active_site import ActiveSite
+from tope.data.config import EC_TOP_LEVEL, PROCESSED_DIR, FEATURES_DIR, PipelineConfig
+from tope.data.features import ActiveSiteFeatures
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +157,7 @@ class DatasetBuilder:
             # Save filtration adjacency matrices
             adj_dir = sample_dir / "adjacency"
             adj_dir.mkdir(exist_ok=True)
-            from data_curation.active_site import ActiveSiteExtractor
+            from tope.data.active_site import ActiveSiteExtractor
             adjs = ActiveSiteExtractor.compute_filtration_adjacencies(site)
             for radius, adj in adjs.items():
                 np.save(str(adj_dir / f"adj_{radius:.1f}.npy"), adj)
