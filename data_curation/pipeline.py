@@ -293,7 +293,7 @@ class CurationPipeline:
             logger.info("Skip download: found %d / %d cached structures", cached, len(pdb_ids))
             return result
 
-        return self.pdb.download_batch(pdb_ids, fmt="cif")
+        return self.pdb.download_batch(pdb_ids, fmt="pdb")
 
     def _step_extract_and_featurise(
         self,

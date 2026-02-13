@@ -36,9 +36,7 @@ RCSB_DOWNLOAD_URL = "https://files.rcsb.org/download"
 
 MCSA_ENTRIES_URL = "https://www.ebi.ac.uk/thornton-srv/m-csa/api/entries/"
 MCSA_RESIDUES_URL = "https://www.ebi.ac.uk/thornton-srv/m-csa/api/residues/"
-MCSA_CSV_URL = (
-    "https://www.ebi.ac.uk/thornton-srv/m-csa/api/entries/?format=csv"
-)
+MCSA_CSV_URL = "https://www.ebi.ac.uk/thornton-srv/m-csa/media/flat_files/curated_data.csv"
 
 
 # ── BRENDA & SABIO-RK (Enzyme Kinetics) ───────────────────────────────────────
