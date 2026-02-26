@@ -29,6 +29,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tope_model.cc_attention import CCAttentionBlock, AttentionMergeNode
+
 # Optional e3nn for full SE(3) equivariance.
 try:
     from e3nn import o3
@@ -54,6 +56,7 @@ class TCPNetConfig:
 
     node_feat_dim: int = 128       # Input per-atom feature dimension (Phase 2)
     edge_feat_dim: int = 32        # Input per-bond feature dimension
+    face_feat_dim: int = 0         # Input per-residue feature dim; 0 = synthesize from edges
     hidden_dim: int = 256          # Internal representation width
     n_layers: int = 6              # Number of TCP message-passing layers
     max_degree: int = 3            # Max spherical-harmonic degree for SE(3)
@@ -268,66 +271,119 @@ class FaceMessagePassing(nn.Module):
         return out
 
 
+# ── Incidence matrix builders ─────────────────────────────────────────────────
+
+def _build_B_01(edge_index: torch.Tensor) -> torch.Tensor:
+    """Build B_01 incidence matrix (atoms→bonds) from edge_index.
+
+    Each bond e has two incident atoms: src[e] and dst[e].
+    Returns (2, 2E) where B_01[0] = atom indices, B_01[1] = bond indices.
+    """
+    E = edge_index.size(1)
+    src, dst = edge_index
+    bond_idx = torch.arange(E, device=edge_index.device)
+    return torch.stack(
+        [torch.cat([src, dst]), torch.cat([bond_idx, bond_idx])],
+        dim=0,
+    )
+
+
+def _build_B_12(face_to_edge: torch.Tensor) -> torch.Tensor:
+    """Build B_12 incidence matrix (bonds→residues) from face_to_edge.
+
+    face_to_edge: (3, F) — each column holds 3 edge indices of a face.
+    Returns (2, 3F) where B_12[0] = bond indices, B_12[1] = residue indices.
+    """
+    F_count = face_to_edge.size(1)
+    face_idx = torch.arange(F_count, device=face_to_edge.device)
+    bond_idx = face_to_edge.reshape(-1)              # (3F,)
+    res_idx = face_idx.unsqueeze(0).expand(3, -1).reshape(-1)  # (3F,)
+    return torch.stack([bond_idx, res_idx], dim=0)
+
+
 # ── Single TCPNet layer ──────────────────────────────────────────────────────
 
 class TCPNetLayer(nn.Module):
-    """One layer of topology-complete message passing.
+    """One layer of topology-complete message passing using CC-attention.
 
     Simultaneously exchanges information between 0-cells (atoms),
-    1-cells (bonds), and 2-cells (residue clusters).
+    1-cells (bonds), and 2-cells (residue clusters) via learned,
+    per-neighborhood normalized attention (CCANN formalism).
+
+    Replaces isotropic scatter_add aggregation with:
+      - attn_01 : CCAttentionBlock for atoms ↔ bonds (B_01 incidence)
+      - attn_12 : CCAttentionBlock for bonds ↔ residues (B_12 incidence)
+      - edge_merge : AttentionMergeNode over two bond neighborhoods
     """
 
     def __init__(self, cfg: TCPNetConfig):
         super().__init__()
         H = cfg.hidden_dim
 
-        # 0-cell → 1-cell (atom features aggregated onto edges)
-        if cfg.use_e3nn and HAS_E3NN:
-            self.node_to_edge = EquivariantEdgeMessage(H, cfg.max_degree)
-        else:
-            self.node_to_edge = ScalarEdgeMessage(H)
+        # CC-attention blocks (replace ScalarEdgeMessage, ScalarNodeMessage,
+        # FaceMessagePassing, and EquivariantEdgeMessage)
+        self.attn_01 = CCAttentionBlock(d_s_in=H, d_t_in=H, d_out=H)  # atoms ↔ bonds
+        self.attn_12 = CCAttentionBlock(d_s_in=H, d_t_in=H, d_out=H)  # bonds ↔ residues
 
-        # 1-cell → 0-cell
-        self.edge_to_node = ScalarNodeMessage(H)
-
-        # 2-cell → 1-cell
-        self.face_to_edge = FaceMessagePassing(H)
+        # Merge bond messages from two neighborhoods: atoms (B_01) + residues (B_12)
+        self.edge_merge = AttentionMergeNode(n_neighborhoods=2, hidden_dim=H)
 
         # Self-interaction MLPs
         self.node_self = nn.Sequential(nn.Linear(H, H), nn.SiLU(), nn.Linear(H, H))
         self.edge_self = nn.Sequential(nn.Linear(H, H), nn.SiLU(), nn.Linear(H, H))
+        self.face_self = nn.Sequential(nn.Linear(H, H), nn.SiLU(), nn.Linear(H, H))
 
         self.residual = cfg.residual
         self.ln_node = nn.LayerNorm(H) if cfg.layer_norm else nn.Identity()
         self.ln_edge = nn.LayerNorm(H) if cfg.layer_norm else nn.Identity()
+        self.ln_face = nn.LayerNorm(H) if cfg.layer_norm else nn.Identity()
         self.dropout = nn.Dropout(cfg.dropout)
 
     def forward(
         self,
-        h_nodes: torch.Tensor,
-        h_edges: torch.Tensor,
-        edge_index: torch.Tensor,
-        pos: torch.Tensor,
-        face_to_edge: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Messages
-        msg_n2e = self.node_to_edge(h_nodes, edge_index, pos)
-        msg_e2n = self.edge_to_node(h_edges, edge_index, h_nodes.size(0))
-        msg_f2e = self.face_to_edge(h_edges, face_to_edge)
+        h_nodes: torch.Tensor,   # (N_atoms, H)
+        h_edges: torch.Tensor,   # (N_bonds, H)
+        h_faces: torch.Tensor,   # (N_residues, H)
+        B_01: torch.Tensor,      # (2, E_01) — B[0]=atom, B[1]=bond
+        B_12: torch.Tensor,      # (2, E_12) — B[0]=bond, B[1]=residue
+        pos: torch.Tensor,       # (N_atoms, 3)  kept for API compat
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns
+        -------
+        h_nodes_new : (N_atoms, H)
+        h_edges_new : (N_bonds, H)
+        h_faces_new : (N_residues, H)
+        """
+        # attn_01: H_s=atoms, H_t=bonds, B=B_01
+        #   K_t = bonds attended by atoms  = msg_n2e
+        #   K_s = atoms attended by bonds  = msg_e2n
+        msg_n2e, msg_e2n = self.attn_01(h_nodes, h_edges, B_01)
 
-        # Update nodes
+        # attn_12: H_s=bonds, H_t=residues, B=B_12
+        #   K_t = residues attended by bonds = face update
+        #   K_s = bonds attended by residues  = msg_f2e
+        K_faces_update, msg_f2e = self.attn_12(h_edges, h_faces, B_12)
+
+        # ── Node update: one neighborhood (bonds via B_01 reverse) ───────────
         h_nodes_new = msg_e2n + self.node_self(h_nodes)
         if self.residual:
             h_nodes_new = h_nodes + self.dropout(h_nodes_new)
         h_nodes_new = self.ln_node(h_nodes_new)
 
-        # Update edges
-        h_edges_new = msg_n2e + msg_f2e + self.edge_self(h_edges)
+        # ── Edge update: two neighborhoods (atoms + residues) ─────────────────
+        h_edges_new = self.edge_merge([msg_n2e, msg_f2e]) + self.edge_self(h_edges)
         if self.residual:
             h_edges_new = h_edges + self.dropout(h_edges_new)
         h_edges_new = self.ln_edge(h_edges_new)
 
-        return h_nodes_new, h_edges_new
+        # ── Face update: one neighborhood (bonds via B_12 forward) ────────────
+        h_faces_new = K_faces_update + self.face_self(h_faces)
+        if self.residual:
+            h_faces_new = h_faces + self.dropout(h_faces_new)
+        h_faces_new = self.ln_face(h_faces_new)
+
+        return h_nodes_new, h_edges_new, h_faces_new
 
 
 # ── Global attention pooling ──────────────────────────────────────────────────
@@ -401,6 +457,11 @@ class EnzymeTCPNet(nn.Module):
             nn.SiLU(),
             nn.Linear(H, H),
         )
+        # Face (2-cell / residue) embedding.
+        # If face_feat_dim > 0, embed from explicit face features;
+        # otherwise project from H (synthesized as mean of incident edge features).
+        face_in = self.cfg.face_feat_dim if self.cfg.face_feat_dim > 0 else H
+        self.face_embed = nn.Linear(face_in, H)
 
         # TCPNet message-passing stack
         self.layers = nn.ModuleList([
@@ -416,11 +477,14 @@ class EnzymeTCPNet(nn.Module):
         ----------
         enzyme_pcc : dict with keys
             node_features : (N, node_feat_dim)
-            edge_index    : (2, E)
+            edge_index    : (2, E)        — kept for backward compat (= B_01 atom adjacency)
             edge_features : (E, edge_feat_dim)
             pos           : (N, 3)
-            face_to_edge  : (3, F) or None
-            batch         : (N,)   graph membership (optional, for batching)
+            B_01          : (2, E_01)     — atoms→bonds incidence (optional; derived if absent)
+            B_12          : (2, E_12)     — bonds→residues incidence (optional; derived if absent)
+            face_features : (F, face_feat_dim) or None
+            face_to_edge  : (3, F) or None   — used to synthesize B_12 / h_faces if needed
+            batch         : (N,)              — graph membership (optional, for batching)
 
         Returns
         -------
@@ -436,8 +500,44 @@ class EnzymeTCPNet(nn.Module):
         face_to_edge = enzyme_pcc.get("face_to_edge")
         batch = enzyme_pcc.get("batch")
 
+        # ── Build / retrieve B_01 ─────────────────────────────────────────────
+        if "B_01" in enzyme_pcc:
+            B_01 = enzyme_pcc["B_01"]
+        else:
+            B_01 = _build_B_01(edge_index)
+
+        # ── Build / retrieve B_12 ─────────────────────────────────────────────
+        if "B_12" in enzyme_pcc:
+            B_12 = enzyme_pcc["B_12"]
+        elif face_to_edge is not None and face_to_edge.numel() > 0:
+            B_12 = _build_B_12(face_to_edge)
+        else:
+            # No 2-cells: empty incidence matrix (1 dummy residue)
+            B_12 = edge_index.new_zeros(2, 0)
+
+        # ── Initialise h_faces ────────────────────────────────────────────────
+        if "face_features" in enzyme_pcc and enzyme_pcc["face_features"] is not None:
+            h_faces = self.face_embed(enzyme_pcc["face_features"])
+        elif B_12.size(1) > 0:
+            # Synthesise: mean of incident edge features per residue
+            n_faces = int(B_12[1].max().item()) + 1
+            bond_idx = B_12[0]  # (E_12,)
+            res_idx = B_12[1]   # (E_12,)
+            H = h_edges.size(-1)
+            face_feat = torch.zeros(n_faces, H, device=h_edges.device, dtype=h_edges.dtype)
+            count = torch.zeros(n_faces, 1, device=h_edges.device, dtype=h_edges.dtype)
+            face_feat.scatter_add_(0, res_idx.unsqueeze(-1).expand(-1, H), h_edges[bond_idx])
+            count.scatter_add_(0, res_idx.unsqueeze(-1), torch.ones(B_12.size(1), 1, device=h_edges.device))
+            face_feat = face_feat / count.clamp(min=1)
+            h_faces = self.face_embed(face_feat)
+        else:
+            # No faces at all — single dummy residue
+            h_faces = self.face_embed(
+                torch.zeros(1, self.face_embed.in_features, device=h_nodes.device)
+            )
+
         for layer in self.layers:
-            h_nodes, h_edges = layer(h_nodes, h_edges, edge_index, pos, face_to_edge)
+            h_nodes, h_edges, h_faces = layer(h_nodes, h_edges, h_faces, B_01, B_12, pos)
 
         enzyme_embedding = self.pool(h_nodes, batch)
         return enzyme_embedding, h_nodes

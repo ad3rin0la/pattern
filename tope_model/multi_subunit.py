@@ -42,6 +42,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tope_model.cc_attention import CCAttentionBlock
+
 logger = logging.getLogger(__name__)
 
 
@@ -790,74 +792,110 @@ class ResidueToSubunitAggregation(nn.Module):
 
 
 class InterfaceMessagePassing(nn.Module):
-    """Message passing across subunit interfaces (4-cells)."""
+    """Message passing across subunit interfaces (4-cells).
+
+    Uses a CCAttentionBlock for bidirectional attention between subunits
+    (rank-3 cells) and interfaces (rank-4 cells) via the B_34 incidence matrix.
+    When B_34 is not pre-built, it is derived automatically from the
+    List[InterfaceCell] objects passed to forward().
+    """
+
+    # 4 scalar interface features: area, H-bonds, salt bridges, type
+    _N_IFACE_FEATS = 4
 
     def __init__(self, hidden_dim: int):
         super().__init__()
+        self.hidden_dim = hidden_dim
 
-        # Interface encoder
-        self.interface_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 4, hidden_dim),  # +4 for interface features
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+        # Embed raw 4-d interface features → hidden_dim
+        self.interface_embed = nn.Linear(self._N_IFACE_FEATS, hidden_dim)
+
+        # CCAttentionBlock: rank-s = subunits (3-cells), rank-t = interfaces (4-cells)
+        self.attn_34 = CCAttentionBlock(
+            d_s_in=hidden_dim,
+            d_t_in=hidden_dim,
+            d_out=hidden_dim,
         )
 
-        # Message combiner
-        self.combiner = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+    def _build_B_34_from_cells(
+        self,
+        interfaces: List["InterfaceCell"],
+        n_subunits: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Materialise interface feature matrix and B_34 incidence tensor.
+
+        Returns
+        -------
+        h_interfaces : (n_interfaces, hidden_dim)
+        B_34         : (2, E_34) — B_34[0] = subunit idx, B_34[1] = interface idx
+        """
+        raw_feats = []
+        src_list: List[int] = []  # subunit indices
+        tgt_list: List[int] = []  # interface indices
+
+        for iface_idx, iface in enumerate(interfaces):
+            i, j = iface.subunit_pair
+            if i >= n_subunits or j >= n_subunits:
+                continue
+            # Each interface touches two subunits
+            src_list.extend([i, j])
+            tgt_list.extend([iface_idx, iface_idx])
+            raw_feats.append([
+                iface.contact_area / 1000.0,
+                iface.hydrogen_bonds / 10.0,
+                iface.salt_bridges / 5.0,
+                1.0 if iface.interface_type == "catalytic" else 0.0,
+            ])
+
+        if not raw_feats:
+            # No valid interfaces — return empty tensors
+            h_iface = torch.zeros(0, self.hidden_dim, device=device)
+            B_34 = torch.zeros(2, 0, dtype=torch.long, device=device)
+            return h_iface, B_34
+
+        feats = torch.tensor(raw_feats, dtype=torch.float32, device=device)
+        h_iface = self.interface_embed(feats)  # (n_interfaces, H)
+        B_34 = torch.tensor(
+            [src_list, tgt_list], dtype=torch.long, device=device
         )
+        return h_iface, B_34
 
     def forward(
         self,
-        h_subunits: torch.Tensor,  # [n_subunits, H]
-        interfaces: List[InterfaceCell],
+        h_subunits: torch.Tensor,              # (n_subunits, H)
+        interfaces: Optional[List["InterfaceCell"]] = None,
+        h_interfaces: Optional[torch.Tensor] = None,   # (n_interfaces, H)
+        B_34: Optional[torch.Tensor] = None,           # (2, E_34)
     ) -> torch.Tensor:
         """
         Mediate communication between subunits via interfaces.
 
+        Either provide pre-built (h_interfaces, B_34) **or** a list of
+        InterfaceCell objects — in the latter case both are derived here.
+
         Returns
         -------
-        msg : [n_subunits, H] interface-mediated messages
+        msg : (n_subunits, H) — interface-mediated messages for each subunit
         """
         n_subunits = h_subunits.size(0)
-        hidden_dim = h_subunits.size(1)
         device = h_subunits.device
 
-        msg = torch.zeros(n_subunits, hidden_dim, device=device)
+        if B_34 is None or h_interfaces is None:
+            if interfaces is None or len(interfaces) == 0:
+                return torch.zeros_like(h_subunits)
+            h_interfaces, B_34 = self._build_B_34_from_cells(
+                interfaces, n_subunits, device
+            )
 
-        for interface in interfaces:
-            i, j = interface.subunit_pair
-            if i >= n_subunits or j >= n_subunits:
-                continue
+        if B_34.size(1) == 0:
+            return torch.zeros_like(h_subunits)
 
-            # Interface features
-            interface_feats = torch.tensor([
-                interface.contact_area / 1000.0,  # Normalize
-                interface.hydrogen_bonds / 10.0,
-                interface.salt_bridges / 5.0,
-                1.0 if interface.interface_type == "catalytic" else 0.0,
-            ], device=device)
-
-            # Concatenate subunit features with interface features
-            combined_ij = torch.cat([
-                h_subunits[i],
-                h_subunits[j],
-                interface_feats,
-            ])
-
-            # Encode interface
-            interface_msg = self.interface_mlp(combined_ij)
-
-            # Pass message to both subunits
-            msg_to_i = self.combiner(torch.cat([h_subunits[i], interface_msg]))
-            msg_to_j = self.combiner(torch.cat([h_subunits[j], interface_msg]))
-
-            msg[i] = msg[i] + msg_to_i
-            msg[j] = msg[j] + msg_to_j
-
-        return msg
+        # CCAttentionBlock: H_s=subunits (rank-3), H_t=interfaces (rank-4)
+        # K_t = updated interface features (not used further)
+        # K_s = updated subunit features = interface-mediated message
+        _, K_subunits = self.attn_34(h_subunits, h_interfaces, B_34)
+        return K_subunits
 
 
 class MultiSubunitTCPNetLayer(nn.Module):
@@ -874,6 +912,13 @@ class MultiSubunitTCPNetLayer(nn.Module):
     def __init__(self, hidden_dim: int = 256, max_degree: int = 3):
         super().__init__()
         self.hidden_dim = hidden_dim
+
+        # CC-attention for residues (2-cells) ↔ subunits (3-cells)
+        self.attn_23 = CCAttentionBlock(
+            d_s_in=hidden_dim,
+            d_t_in=hidden_dim,
+            d_out=hidden_dim,
+        )
 
         # Standard 0↔1↔2 cell messages (simplified versions)
         self.node_update = nn.Sequential(
@@ -916,58 +961,59 @@ class MultiSubunitTCPNetLayer(nn.Module):
 
     def forward(
         self,
-        h_nodes: torch.Tensor,      # [n_atoms, H]
-        h_edges: torch.Tensor,      # [n_edges, H]
-        h_faces: torch.Tensor,      # [n_residues, H]
-        h_subunits: torch.Tensor,   # [n_subunits, H]
-        edge_index: torch.Tensor,   # [2, n_edges]
+        h_nodes: torch.Tensor,       # (n_atoms, H)
+        h_edges: torch.Tensor,       # (n_edges, H)
+        h_faces: torch.Tensor,       # (n_residues, H)
+        h_subunits: torch.Tensor,    # (n_subunits, H)
+        edge_index: torch.Tensor,    # (2, n_edges)
         subunit_membership: Dict[int, int],
         interfaces: List[InterfaceCell],
+        B_23: Optional[torch.Tensor] = None,  # (2, E_23) residues→subunits incidence
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Multi-scale message passing across all cell dimensions.
+
+        When B_23 is provided, uses CCAttentionBlock for residue↔subunit messages
+        (2-cells ↔ 3-cells); otherwise falls back to the dict-based approach.
 
         Returns
         -------
         h_nodes_new, h_edges_new, h_faces_new, h_subunits_new
         """
-        # ── Standard 0↔1↔2 messages (simplified) ──
-
-        # Node aggregation from edges
+        # ── Standard 0↔1↔2 messages (simplified scatter) ──────────────────────
         edge_src = edge_index[0]
         edge_dst = edge_index[1]
 
         node_msg = torch.zeros_like(h_nodes)
-        for e_idx in range(edge_index.size(1)):
-            src, dst = edge_src[e_idx].item(), edge_dst[e_idx].item()
-            if src < h_nodes.size(0) and dst < h_nodes.size(0):
-                node_msg[dst] = node_msg[dst] + h_edges[e_idx]
-
-        # Edge aggregation from nodes
-        edge_msg = torch.zeros_like(h_edges)
-        for e_idx in range(edge_index.size(1)):
-            src, dst = edge_src[e_idx].item(), edge_dst[e_idx].item()
-            if src < h_nodes.size(0) and dst < h_nodes.size(0):
-                edge_msg[e_idx] = h_nodes[src] + h_nodes[dst]
-
-        # ── 3-cell (subunit) messages ──
-
-        # Subunits broadcast to residues
-        msg_subunit_residue = self.subunit_to_residue(
-            h_subunits, h_faces, subunit_membership
+        node_msg.scatter_add_(
+            0,
+            edge_dst.unsqueeze(-1).expand(-1, h_nodes.size(-1)),
+            h_edges,
         )
 
-        # Residues aggregate to subunits
-        msg_residue_subunit = self.residue_to_subunit(
-            h_faces, subunit_membership, h_subunits.size(0)
-        )
+        edge_msg = h_nodes[edge_src] + h_nodes[edge_dst]
 
-        # ── 4-cell (interface) messages ──
+        # ── 2-cells ↔ 3-cells (residues ↔ subunits) ────────────────────────────
+        if B_23 is not None and B_23.size(1) > 0:
+            # CCAttentionBlock: H_s = residues (rank-2), H_t = subunits (rank-3)
+            # K_t = subunits attended by residues = msg_residue→subunit
+            # K_s = residues attended by subunits = msg_subunit→residue
+            msg_residue_subunit, msg_subunit_residue = self.attn_23(
+                h_faces, h_subunits, B_23
+            )
+        else:
+            # Fallback: dict-based broadcast / aggregation
+            msg_subunit_residue = self.subunit_to_residue(
+                h_subunits, h_faces, subunit_membership
+            )
+            msg_residue_subunit = self.residue_to_subunit(
+                h_faces, subunit_membership, h_subunits.size(0)
+            )
 
+        # ── 3-cells ↔ 4-cells (subunits ↔ interfaces) ─────────────────────────
         msg_interface_subunit = self.interface_to_subunit(h_subunits, interfaces)
 
-        # ── Update all cell features ──
-
+        # ── Update all cell features ───────────────────────────────────────────
         h_nodes_new = self.norm_nodes(
             h_nodes + self.node_update(torch.cat([h_nodes, node_msg], dim=-1))
         )
@@ -986,7 +1032,7 @@ class MultiSubunitTCPNetLayer(nn.Module):
             h_subunits + self.subunit_update(
                 torch.cat([
                     msg_residue_subunit + msg_interface_subunit,
-                    h_subunits
+                    h_subunits,
                 ], dim=-1)
             )
         )
@@ -1089,11 +1135,14 @@ class MultiSubunitTCPNet(nn.Module):
                 h_subunits[sub_idx] = h_subunits[sub_idx] / count
         h_subunits = self.subunit_embed(h_subunits)
 
+        # Optional higher-rank incidence matrices from PCC
+        B_23 = enzyme_pcc.get("B_23")  # (2, E_23) residues→subunits
+
         # Message passing layers
         for layer in self.layers:
             h_nodes, h_edges, h_faces, h_subunits = layer(
                 h_nodes, h_edges, h_faces, h_subunits,
-                edge_index, subunit_membership, interfaces
+                edge_index, subunit_membership, interfaces, B_23,
             )
 
         # Global readout (pool all cell types)

@@ -179,6 +179,11 @@ Usage:
     p_lap.initialize_from_pcc(enzyme_pcc)  # p ∝ u_h
 """
 
+from tope_model.cc_attention import (
+    CCAttentionPushForward,
+    CCAttentionBlock,
+    AttentionMergeNode,
+)
 from tope_model.tope_model import (
     ToPEModel,
     ToPEConfig,
@@ -318,6 +323,10 @@ from tope_model.transfer_pathways import (
 )
 
 __all__ = [
+    # CCANN primitives
+    "CCAttentionPushForward",
+    "CCAttentionBlock",
+    "AttentionMergeNode",
     # Phase 3: Models
     "ToPEModel",
     "ToPEConfig",
