@@ -107,6 +107,12 @@ from tope.models.memory_optimized import (
     profile_memory_usage,
     estimate_max_batch_size,
 )
+from tope.models.cc_attention import (
+    CCAttentionPushForward,
+    CCAttentionBlock,
+    AttentionMergeNode,
+    build_zone_adjacency,
+)
 
 __all__ = [
     # Core models
@@ -182,4 +188,9 @@ __all__ = [
     "MemoryOptimizedTrainer",
     "profile_memory_usage",
     "estimate_max_batch_size",
+    # CCANN primitives
+    "CCAttentionPushForward",
+    "CCAttentionBlock",
+    "AttentionMergeNode",
+    "build_zone_adjacency",
 ]

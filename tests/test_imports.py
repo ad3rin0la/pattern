@@ -87,6 +87,15 @@ def test_import_mcp_adapters():
     )
 
 
+def test_import_cc_attention():
+    """Test importing CCANN attention primitives."""
+    from tope.models import (
+        CCAttentionPushForward,
+        CCAttentionBlock,
+        AttentionMergeNode,
+    )
+
+
 def test_import_data():
     """Test importing data curation package."""
     from tope.data import (

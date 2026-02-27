@@ -38,6 +38,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from tope.models.tcpnet import GaussianRBF, CosineCutoff
+from tope.models.cc_attention import CCAttentionPushForward, build_zone_adjacency
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -108,12 +109,25 @@ class EquivariantMessageFunction(nn.Module):
 # ── Single message-passing layer ──────────────────────────────────────────────
 
 class ProteinMessagePassingLayer(nn.Module):
-    """One residue-to-residue message-passing layer."""
+    """One residue-to-residue message-passing layer.
+
+    Node aggregation uses CC-attention push-forward (CCAttentionPushForward)
+    rather than isotropic scatter-add.  The EquivariantMessageFunction output
+    becomes the *value* in the attention-weighted sum; the attention *score*
+    is computed from source/target node features plus RBF distance encoding.
+    """
 
     def __init__(self, hidden_dim: int, n_rbf: int = 20, cutoff: float = 15.0,
                  dropout: float = 0.1):
         super().__init__()
         self.message_fn = EquivariantMessageFunction(hidden_dim, n_rbf, cutoff)
+
+        # Attention-weighted node aggregation (distance-augmented score)
+        self.node_attn = CCAttentionPushForward(
+            d_in=hidden_dim,
+            d_out=hidden_dim,
+            d_edge=n_rbf,          # RBF features concatenated into attention score
+        )
 
         self.node_update = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -128,6 +142,8 @@ class ProteinMessagePassingLayer(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self._n_rbf = n_rbf
+        self._cutoff = cutoff
 
     def forward(
         self,
@@ -136,15 +152,26 @@ class ProteinMessagePassingLayer(nn.Module):
         edge_index: torch.Tensor,
         coords: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        from tope_model.tcpnet import GaussianRBF, CosineCutoff
         row, col = edge_index
         edge_vec = coords[row] - coords[col]
         edge_dist = edge_vec.norm(dim=-1, keepdim=True)
 
-        messages = self.message_fn(h_nodes[row], h_nodes[col], edge_dist)
+        # EquivariantMessageFunction output → used as attention values
+        messages = self.message_fn(h_nodes[row], h_nodes[col], edge_dist)  # (E, H)
 
-        # Aggregate → nodes (scatter-add to target)
-        node_agg = torch.zeros_like(h_nodes)
-        node_agg.scatter_add_(0, col.unsqueeze(-1).expand_as(messages), messages)
+        # RBF distance features for attention score
+        rbf_fn = self.message_fn.rbf                          # GaussianRBF instance
+        rbf_feat = rbf_fn(edge_dist.squeeze(-1))              # (E, n_rbf)
+
+        # Attention-weighted aggregation to target nodes (col).
+        # adj convention: adj[0]=source (row), adj[1]=target (col)
+        node_agg = self.node_attn(
+            h_nodes,
+            edge_index,
+            edge_attr=rbf_feat,
+            value=messages,
+        )  # (N, H)
 
         h_nodes_new = self.node_update(torch.cat([h_nodes, node_agg], dim=-1))
         h_edges_new = self.edge_update(
@@ -157,26 +184,38 @@ class ProteinMessagePassingLayer(nn.Module):
 # ── Zone-aware attention pooling ──────────────────────────────────────────────
 
 class ZoneAwareAttention(nn.Module):
-    """Global attention pooling with learned zone biases.
+    """Global attention pooling with learned zone biases and intra-zone attention.
 
     Active-site residues (Zone 1) receive a higher prior; the model
     learns to up-weight distant residues when they carry allosteric signal.
+
+    Intra-zone attention (CCAttentionPushForward) refines node representations
+    within each zone before pooling, then inter-zone weights (b^k = softmax of
+    zone_bias) combine zone-level pooled vectors.
     """
 
     def __init__(self, hidden_dim: int, n_zones: int = 3):
         super().__init__()
+        self.hidden_dim = hidden_dim
         self.attention_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
-        # Learnable zone priors — Zone 1 starts with higher bias
+        # Learnable zone priors — Zone 1 starts with higher bias (used as inter-zone b^k)
         self.zone_bias = nn.Parameter(torch.tensor([2.0, 0.5, 0.0]))
+
+        # Intra-zone attention: refine node representations within each zone
+        self.intra_zone_attn = nn.ModuleList([
+            CCAttentionPushForward(d_in=hidden_dim, d_out=hidden_dim)
+            for _ in range(n_zones)
+        ])
 
     def forward(
         self,
         h_nodes: torch.Tensor,
         zone_assignments: torch.Tensor,
+        edge_index: torch.Tensor,
         batch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
@@ -184,33 +223,59 @@ class ZoneAwareAttention(nn.Module):
         ----------
         h_nodes          : (N, H)
         zone_assignments : (N,)  values in {0, 1, 2}
+        edge_index       : (2, E) global edge index used for intra-zone adjacency
         batch            : (N,)  graph membership (optional)
 
         Returns
         -------
         pooled : (B, H)
         """
+        H = self.hidden_dim
+
+        # ── Intra-zone attention + pooling ────────────────────────────────────
+        zone_embeddings = []
+        for z in range(3):
+            mask = zone_assignments == z
+            if not mask.any():
+                zone_embeddings.append(torch.zeros(H, device=h_nodes.device))
+                continue
+
+            h_zone = h_nodes[mask]  # (N_z, H)
+            zone_adj = build_zone_adjacency(mask, edge_index)  # (2, E_z), zone-local
+
+            if zone_adj.size(1) > 0:
+                h_zone_attended = self.intra_zone_attn[z](h_zone, zone_adj)  # (N_z, H)
+            else:
+                # No edges within zone — skip attention, use raw features
+                h_zone_attended = h_zone
+
+            zone_embeddings.append(h_zone_attended.mean(dim=0))  # (H,)
+
+        # ── Inter-zone aggregation with learnable b^k weights ─────────────────
+        b_k = torch.softmax(self.zone_bias, dim=0)  # (3,)
+        pooled_zone = sum(b_k[z] * zone_embeddings[z] for z in range(3))  # (H,)
+
+        # ── Standard per-graph attention pooling (with zone bias) ─────────────
         attn_logits = self.attention_mlp(h_nodes).squeeze(-1)  # (N,)
-        zone_bias = self.zone_bias[zone_assignments]            # (N,)
-        attn_logits = attn_logits + zone_bias
+        attn_logits = attn_logits + self.zone_bias[zone_assignments]
 
         if batch is None:
-            # Single graph
             weights = torch.softmax(attn_logits, dim=0)
-            return (weights.unsqueeze(-1) * h_nodes).sum(dim=0, keepdim=True)
+            pooled_global = (weights.unsqueeze(-1) * h_nodes).sum(dim=0, keepdim=True)
+            # Blend with zone-structured pooled representation
+            return pooled_global + pooled_zone.unsqueeze(0)
 
         # Per-graph softmax
         weights = torch.zeros_like(attn_logits)
         for gid in batch.unique():
-            mask = batch == gid
-            weights[mask] = torch.softmax(attn_logits[mask], dim=0)
+            gmask = batch == gid
+            weights[gmask] = torch.softmax(attn_logits[gmask], dim=0)
 
         weighted = weights.unsqueeze(-1) * h_nodes
         n_graphs = int(batch.max().item()) + 1
-        H = h_nodes.size(-1)
         out = torch.zeros(n_graphs, H, device=h_nodes.device)
         out.scatter_add_(0, batch.unsqueeze(-1).expand_as(weighted), weighted)
-        return out
+        return out + pooled_zone.unsqueeze(0)
 
 
 # ── Full whole-protein TCPNet ─────────────────────────────────────────────────
@@ -336,7 +401,7 @@ class WholeProteinTCPNet(nn.Module):
             h_edges = self.edge_norms[i](h_edges + h_edges_new)
 
         enzyme_embedding = self.zone_pool(
-            h_nodes, protein_graph["zone_assignments"], batch
+            h_nodes, protein_graph["zone_assignments"], edge_index, batch
         )
 
         return enzyme_embedding, h_nodes
