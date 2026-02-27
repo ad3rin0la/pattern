@@ -42,7 +42,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tope_model.cc_attention import CCAttentionBlock
+from tope.models.cc_attention import CCAttentionBlock
 
 logger = logging.getLogger(__name__)
 

@@ -1,25 +1,26 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=65.0", "wheel", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "tope"
 version = "0.1.0"
-description = "ToPE: Topological Pattern Recognition for Enzymes - Deep learning architecture for enzyme function prediction using persistent homology and geometric deep learning"
+description = "ToPE: Topological Pattern Recognition for Enzymes - Structure-to-function prediction via persistent sheaf Laplacians and topological deep learning"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
 authors = [
-    {name = "ToPE Contributors"}
+    {name = "Derin Fasipe"}
 ]
 keywords = [
-    "enzyme",
-    "deep-learning",
-    "topological-data-analysis",
-    "persistent-homology",
-    "graph-neural-networks",
-    "protein-structure",
+    "computational biology",
+    "topological data analysis",
+    "enzyme catalysis",
+    "persistent homology",
+    "graph neural networks",
+    "protein structure",
     "bioinformatics",
+    "sheaf Laplacian",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -30,6 +31,7 @@ classifiers = [
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
     "Topic :: Scientific/Engineering :: Chemistry",
@@ -47,6 +49,8 @@ dependencies = [
     "pandas>=2.1",
     "pyarrow>=14.0",
     "requests>=2.31",
+    "tqdm>=4.62.0",
+    "pyyaml>=6.0",
 
     # Structure parsing
     "biopython>=1.83",
@@ -69,12 +73,23 @@ sasa = [
     "freesasa>=2.2",
 ]
 tda = [
-    # Traditional TDA (optional, replaced by TTN)
+    # Traditional TDA (optional, largely replaced by TTN)
     "gudhi>=3.9",
     "giotto-tda>=0.6",
 ]
+docs = [
+    "sphinx>=5.0",
+    "sphinx-rtd-theme>=1.0",
+    "nbsphinx>=0.8",
+    "myst-parser>=0.18",
+]
+viz = [
+    "matplotlib>=3.5",
+    "seaborn>=0.12",
+    "plotly>=5.0",
+]
 all = [
-    "tope[dev,sasa,tda]",
+    "tope[dev,sasa,tda,docs,viz]",
 ]
 
 [project.urls]
@@ -84,16 +99,22 @@ Repository = "https://github.com/ad3rin0la/pattern"
 Issues = "https://github.com/ad3rin0la/pattern/issues"
 
 [project.scripts]
-tope-train = "tope_model.trainer:main"
-tope-curate = "data_curation.pipeline:main"
-tope-ingest-topec = "data_curation.topec_ingestion:main"
+tope-train = "tope.training.cli:main"
+tope-curate = "tope.data.cli:curate"
+tope-predict = "tope.models.cli:predict"
+tope-ingest-topec = "tope.data.cli:ingest_topec"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["tope_model*", "data_curation*"]
+include = ["tope*"]
 
 [tool.setuptools.package-data]
-"*" = ["*.txt", "*.md"]
+tope = [
+    "data/voip_tables/*.json",
+    "data/ec_hierarchy/*.yaml",
+    "*.txt",
+    "*.md",
+]
 
 [tool.black]
 line-length = 100
@@ -127,15 +148,16 @@ ignore = [
 ]
 
 [tool.ruff.isort]
-known-first-party = ["tope_model", "data_curation"]
+known-first-party = ["tope"]
 
 [tool.mypy]
 python_version = "3.9"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
+disallow_untyped_defs = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-v --tb=short"
+addopts = "-v --tb=short --cov=tope --cov-report=term"

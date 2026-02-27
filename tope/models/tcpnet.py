@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tope_model.cc_attention import CCAttentionBlock, AttentionMergeNode
+from tope.models.cc_attention import CCAttentionBlock, AttentionMergeNode
 
 # Optional e3nn for full SE(3) equivariance.
 try:

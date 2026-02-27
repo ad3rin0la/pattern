@@ -37,8 +37,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tope_model.tcpnet import GaussianRBF, CosineCutoff
-from tope_model.cc_attention import CCAttentionPushForward, build_zone_adjacency
+from tope.models.tcpnet import GaussianRBF, CosineCutoff
+from tope.models.cc_attention import CCAttentionPushForward, build_zone_adjacency
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────

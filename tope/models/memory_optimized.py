@@ -28,7 +28,7 @@ Enables:
 - End-to-end differentiability
 
 Usage:
-    from tope_model.memory_optimized import MemoryOptimizedToPE, MemoryOptimizedConfig
+    from tope.models import MemoryOptimizedToPE, MemoryOptimizedConfig
 
     cfg = MemoryOptimizedConfig(
         use_gradient_checkpointing=True,

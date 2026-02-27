@@ -65,8 +65,8 @@ Thumbs.db
 logs/
 *.log
 
-# Data (large files)
-data/
+# Data (large files - top-level data dir only)
+/data/
 *.parquet
 *.h5
 *.hdf5
