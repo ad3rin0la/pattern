@@ -25,6 +25,7 @@ from tope.topology.phonon_topology import (
     SheafENM,
     build_cofactor_3cells,
     PhononTopologyFeatures,
+    sheaf_sections_from_voip_tensor,
 )
 from tope.topology.transfer_pathways import (
     PathwayType,
@@ -52,6 +53,7 @@ __all__ = [
     "SheafENM",
     "build_cofactor_3cells",
     "PhononTopologyFeatures",
+    "sheaf_sections_from_voip_tensor",
     # Transfer pathways
     "PathwayType",
     "TransferPathwayConfig",

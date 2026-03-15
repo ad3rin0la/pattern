@@ -147,3 +147,24 @@ def test_import_transfer_pathways():
         TransferPathwayVisualizer,
         extract_transfer_pathway_graph,
     )
+
+
+def test_import_quantum():
+    """Test importing Phase 5A quantum VOIP-SIREN components."""
+    from tope.quantum import (
+        AttentiveVOIPEncoder,
+        VOIPSheafSectionBuilder,
+        VOIPSIRENConfig,
+        XTBContextEncoder,
+        BandAttention,
+        SpatialGlobalAttention,
+        VOIPSIRENField,
+        SpectralPosEncoding,
+        BandSIREN,
+        SubstrateVOIPCrossAttention,
+    )
+
+
+def test_import_sheaf_voip_shim():
+    """Test importing the sheaf-section conversion shim."""
+    from tope.topology import sheaf_sections_from_voip_tensor

@@ -12,6 +12,7 @@ Subpackages:
     tope.training    - Training utilities, losses, and evaluation metrics
     tope.attribution - Multi-scale attribution and OOD validation
     tope.utils       - MCP adapters and shared utilities
+    tope.quantum     - Differentiable electronic-structure primitives (Phase 5A)
 
 Quick start::
 
@@ -70,6 +71,13 @@ from tope.topology import (
     TransferPathwayHead,
 )
 
+# Quantum (differentiable VOIP field — Phase 5A)
+from tope.quantum import (
+    AttentiveVOIPEncoder,
+    VOIPSheafSectionBuilder,
+    VOIPSIRENConfig,
+)
+
 __all__ = [
     "__version__",
     # Models
@@ -99,4 +107,8 @@ __all__ = [
     "TriParameterTTN",
     "HodgeLaplacianENM",
     "TransferPathwayHead",
+    # Quantum
+    "AttentiveVOIPEncoder",
+    "VOIPSheafSectionBuilder",
+    "VOIPSIRENConfig",
 ]

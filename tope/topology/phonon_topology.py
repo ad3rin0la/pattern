@@ -28,11 +28,14 @@ References:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 from scipy.sparse import csr_matrix, lil_matrix
 from scipy.sparse.linalg import spsolve
+
+if TYPE_CHECKING:
+    import torch
 from scipy.spatial.distance import cdist, pdist, squareform
 
 
@@ -672,6 +675,26 @@ def extract_cofactor_sheaf_sections(
         sections[idx] = features
 
     return sections
+
+
+def sheaf_sections_from_voip_tensor(
+    voip_sections: "torch.Tensor",
+) -> Dict[int, np.ndarray]:
+    """
+    Convert (N, 8) VOIPSheafSectionBuilder output to the Dict[int, np.ndarray]
+    format expected by SheafENM.sheaf_laplacian().
+
+    Parameters
+    ----------
+    voip_sections : (N, 8) float tensor from AttentiveVOIPEncoder /
+                    VOIPSheafSectionBuilder.forward()
+
+    Returns
+    -------
+    Dict mapping atom index → (8,) numpy array
+    """
+    arr = voip_sections.detach().cpu().numpy()
+    return {i: arr[i] for i in range(arr.shape[0])}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
