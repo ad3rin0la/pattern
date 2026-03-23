@@ -113,6 +113,12 @@ from tope.models.cc_attention import (
     AttentionMergeNode,
     build_zone_adjacency,
 )
+from tope.models.tope_residual import (
+    IntraRankResidualBlock,
+    InterRankResidualMergeNode,
+    SpectralResidualTTN,
+    ToPERankStack,
+)
 
 __all__ = [
     # Core models
@@ -193,4 +199,9 @@ __all__ = [
     "CCAttentionBlock",
     "AttentionMergeNode",
     "build_zone_adjacency",
+    # Deep residual learning
+    "IntraRankResidualBlock",
+    "InterRankResidualMergeNode",
+    "SpectralResidualTTN",
+    "ToPERankStack",
 ]
