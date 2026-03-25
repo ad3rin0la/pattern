@@ -512,6 +512,66 @@ class SheafENM(HodgeLaplacianENM):
 
         return L_sheaf
 
+    def build_restriction_maps(
+        self,
+        rank: int,
+        sheaf_sections: Dict[int, np.ndarray],
+    ) -> Dict[tuple, np.ndarray]:
+        """Return the metric-aware restriction maps as an explicit dict.
+
+        Keys are (i, j) pairs for which a non-zero off-diagonal block exists
+        in the sheaf Laplacian.  Values are the (d, d) projection matrices:
+
+            R_ij = (G @ delta) ⊗ (G @ delta) / (delta^T G delta)
+
+        This mirrors the construction in sheaf_laplacian() and is exposed
+        so that g_structure.nijenhuis_norm_per_cell() can consume the maps
+        without re-computing the Hodge Laplacian.
+
+        Returns
+        -------
+        R : dict[(i, j) → np.ndarray of shape (d, d)]
+        """
+        L_k = self.hodge_laplacian(rank)
+        d = self.sheaf_dim
+        G = self.descriptor_metric
+        L_k_dense = L_k.toarray() if hasattr(L_k, "toarray") else L_k
+        rows, cols = np.where(L_k_dense != 0)
+
+        R: Dict[tuple, np.ndarray] = {}
+        for idx in range(len(rows)):
+            i, j = int(rows[idx]), int(cols[idx])
+            if i != j and i in sheaf_sections and j in sheaf_sections:
+                delta = sheaf_sections[i] - sheaf_sections[j]
+                G_delta = G @ delta
+                inner = float(delta @ G_delta) + 1e-10
+                R[(i, j)] = np.outer(G_delta, G_delta) / inner
+        return R
+
+    def sheaf_endomorphism(
+        self,
+        sheaf_sections: Dict[int, np.ndarray],
+    ) -> np.ndarray:
+        """Return the VOIP-weighted sheaf endomorphism B for each cell.
+
+        B_i = diag(v_i)  where v_i = sheaf_sections[i] (the VOIP vector).
+
+        This is the (1,1) tensor field J in Clark-Bruckheimer's framework.
+        When the GFN2-xTB corrections make D(B) = 0 (covariantly constant),
+        B is a *special* tensor field and the G-structure is determined.
+
+        Returns
+        -------
+        B : (N, d, d) array of per-cell diagonal endomorphisms.
+            B[i] = np.diag(sheaf_sections[i]).
+        """
+        keys = sorted(sheaf_sections.keys())
+        d = self.sheaf_dim
+        B = np.zeros((len(keys), d, d))
+        for idx, k in enumerate(keys):
+            B[idx] = np.diag(sheaf_sections[k])
+        return B
+
     def sheaf_localization_landscape(
         self,
         rank: int,

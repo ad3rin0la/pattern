@@ -35,6 +35,16 @@ from tope.topology.transfer_pathways import (
     TransferPathwayVisualizer,
     extract_transfer_pathway_graph,
 )
+from tope.topology.g_structure import (
+    nijenhuis_norm_per_cell,
+    build_restriction_maps,
+    chern_invariant,
+    frust_index_cb,
+    voip_covariant_loss,
+    almost_tangent_score,
+    AlmostTangentDetector,
+    nijenhuis_signal,
+)
 
 __all__ = [
     # TTN persistent homology
@@ -61,4 +71,13 @@ __all__ = [
     "TransferPathwayLoss",
     "TransferPathwayVisualizer",
     "extract_transfer_pathway_graph",
+    # G-structure (Clark-Bruckheimer)
+    "nijenhuis_norm_per_cell",
+    "build_restriction_maps",
+    "chern_invariant",
+    "frust_index_cb",
+    "voip_covariant_loss",
+    "almost_tangent_score",
+    "AlmostTangentDetector",
+    "nijenhuis_signal",
 ]

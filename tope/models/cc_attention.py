@@ -61,6 +61,41 @@ try:
 except ImportError:
     HAS_TORCH_SCATTER = False
 
+# Differentiable Nijenhuis tensor norm — allosteric coupling signal.
+# Import is lazy so that cc_attention remains usable without the full
+# topology package (e.g. in lightweight inference deployments).
+try:
+    from tope.topology.g_structure import nijenhuis_signal as _nijenhuis_signal
+    HAS_G_STRUCTURE = True
+except ImportError:
+    HAS_G_STRUCTURE = False
+
+
+def nijenhuis_signal(voip: "Tensor", edge_index: "Tensor") -> "Tensor":
+    """Per-node Nijenhuis tensor norm from VOIP vectors (allosteric signal).
+
+    Thin wrapper that delegates to tope.topology.g_structure.nijenhuis_signal
+    and raises an informative error when the topology package is unavailable.
+
+    Parameters
+    ----------
+    voip : (N, d) VOIP tensor (output of VOIPSIRENField / AttentiveVOIPEncoder).
+    edge_index : (2, E) directed edge index at rank 0.
+
+    Returns
+    -------
+    N_norms : (N,) differentiable Nijenhuis norm per node.
+        Large values at rank-2 cells indicate allosteric coupling.
+        Used as an auxiliary feature or interpretability readout alongside
+        the cross-rank CC-attention weights.
+    """
+    if not HAS_G_STRUCTURE:
+        raise ImportError(
+            "nijenhuis_signal requires tope.topology.g_structure. "
+            "Install the full tope package or import from tope.topology directly."
+        )
+    return _nijenhuis_signal(voip, edge_index)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Internal utilities
