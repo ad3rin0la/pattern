@@ -436,9 +436,18 @@ class SheafENM(HodgeLaplacianENM):
         enzyme_pcc: Dict[str, Any],
         sheaf_dim: int = 8,
         config: Optional[PhononTopologyConfig] = None,
+        descriptor_metric: Optional[np.ndarray] = None,
     ):
         super().__init__(enzyme_pcc, config=config)
         self.sheaf_dim = sheaf_dim
+        # Descriptor-space metric G: encodes the natural inner product in the
+        # stalk space.  Off-diagonal units (VOIP in eV, CN dimensionless,
+        # χ in Pauling units, …) make the Euclidean inner product non-invariant;
+        # supplying a physics-motivated diagonal G corrects this (Cerrini 1971).
+        # Defaults to identity, which reproduces the previous Euclidean behaviour.
+        self.descriptor_metric: np.ndarray = (
+            descriptor_metric if descriptor_metric is not None else np.eye(sheaf_dim)
+        )
 
     def sheaf_laplacian(
         self,
@@ -478,10 +487,17 @@ class SheafENM(HodgeLaplacianENM):
                 s_i = sheaf_sections[i]
                 s_j = sheaf_sections[j]
 
-                # Restriction map: outer product of descriptor difference
+                # Restriction map: metric-aware outer product (Cerrini 1971).
+                # G @ delta is the covariant form of the descriptor difference
+                # (index-lowering).  delta^T G delta is the metric-invariant
+                # norm squared; the outer product G_delta ⊗ G_delta gives the
+                # correct rank-1 restriction map that is invariant to separate
+                # scalings of each descriptor axis.
                 delta = s_i - s_j
-                delta_norm = np.dot(delta, delta) + 1e-10
-                R_ij = np.outer(delta, delta) / delta_norm
+                G = self.descriptor_metric
+                G_delta = G @ delta
+                inner = float(delta @ G_delta) + 1e-10
+                R_ij = np.outer(G_delta, G_delta) / inner
 
                 # Scale by graph Laplacian weight
                 L_sheaf[i*d:(i+1)*d, j*d:(j+1)*d] = w * (np.eye(d) - R_ij)

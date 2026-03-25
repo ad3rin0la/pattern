@@ -481,6 +481,12 @@ class MultiParameterTTN(nn.Module):
         # === Spatial Branch ===
         spatial_leaf_outputs = []
         spatial_data = filtration_features['spatial']  # (batch, n_steps, k)
+        # Normalize by per-step spectral radius so spatial eigenvalues (units
+        # Å⁻²) are dimensionless before TTN contraction with the electronic
+        # branch (units eV²).  This is the spectral analogue of Cerrini's
+        # unit-cell frame normalisation: each axis rescaled by its natural
+        # length before cross-branch comparison.
+        spatial_data = spatial_data / (spatial_data.max(dim=-1, keepdim=True).values + 1e-8)
         n_zones = len(self.spatial_leaves)
         steps_per_zone = spatial_data.size(1) // n_zones
 
@@ -499,6 +505,7 @@ class MultiParameterTTN(nn.Module):
         # === Electronic Branch ===
         voip_leaf_outputs = []
         voip_data = filtration_features['voip']  # (batch, n_steps, k)
+        voip_data = voip_data / (voip_data.max(dim=-1, keepdim=True).values + 1e-8)
         n_voip_ranges = len(self.voip_leaves)
         steps_per_range = voip_data.size(1) // n_voip_ranges
 
@@ -754,6 +761,7 @@ class TriParameterTTN(nn.Module):
         # === Spatial Branch ===
         spatial_leaf_outputs = []
         spatial_data = filtration_features['spatial']
+        spatial_data = spatial_data / (spatial_data.max(dim=-1, keepdim=True).values + 1e-8)
         n_zones = len(self.spatial_leaves)
         steps_per_zone = max(1, spatial_data.size(1) // n_zones)
 
@@ -771,6 +779,7 @@ class TriParameterTTN(nn.Module):
         # === Electronic Branch ===
         voip_leaf_outputs = []
         voip_data = filtration_features['voip']
+        voip_data = voip_data / (voip_data.max(dim=-1, keepdim=True).values + 1e-8)
         n_voip_ranges = len(self.voip_leaves)
         steps_per_range = max(1, voip_data.size(1) // n_voip_ranges)
 
@@ -789,6 +798,7 @@ class TriParameterTTN(nn.Module):
         if 'vibrational' in filtration_features and u_h is not None:
             vib_leaf_outputs = []
             vib_data = filtration_features['vibrational']
+            vib_data = vib_data / (vib_data.max(dim=-1, keepdim=True).values + 1e-8)
 
             for i, leaf in enumerate(self.vibrational_leaves):
                 if i < vib_data.size(1):

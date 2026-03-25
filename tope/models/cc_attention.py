@@ -247,6 +247,7 @@ class CCAttentionBlock(nn.Module):
         n_heads: int = 1,
         dropout: float = 0.0,
         negative_slope: float = 0.2,
+        n_ranks: int = 1,
     ) -> None:
         super().__init__()
         assert d_out % n_heads == 0
@@ -266,11 +267,30 @@ class CCAttentionBlock(nn.Module):
         self.leaky_relu = nn.LeakyReLU(negative_slope)
         self.dropout: nn.Module = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
+        # Per-rank learnable metric matrices G_r^{1/2}, one per CC rank.
+        # When n_ranks > 1, the covariant form of each projected feature is
+        # G_r^{1/2} @ W_r H, making cross-rank attention invariant to the
+        # separate scalings of each rank's descriptor space (Cerrini 1971).
+        # Initialized to identity so training starts from the Euclidean baseline.
+        self.n_ranks = n_ranks
+        if n_ranks > 1:
+            self.metric_s = nn.ParameterList([
+                nn.Parameter(torch.eye(self.head_dim)) for _ in range(n_ranks)
+            ])
+            self.metric_t = nn.ParameterList([
+                nn.Parameter(torch.eye(self.head_dim)) for _ in range(n_ranks)
+            ])
+        else:
+            self.metric_s = None
+            self.metric_t = None
+
     def forward(
         self,
         H_s: Tensor,
         H_t: Tensor,
         B: Tensor,
+        rank_s: int = 0,
+        rank_t: int = 0,
     ) -> Tuple[Tensor, Tensor]:
         """
         Parameters
@@ -278,6 +298,8 @@ class CCAttentionBlock(nn.Module):
         H_s : (N_s, d_s_in)
         H_t : (N_t, d_t_in)
         B   : (2, E) — B[0] = rank-s indices, B[1] = rank-t indices
+        rank_s, rank_t : CC ranks for source and target cells (used when
+            n_ranks > 1 to select the per-rank metric G_r^{1/2})
 
         Returns
         -------
@@ -289,6 +311,13 @@ class CCAttentionBlock(nn.Module):
 
         Ws_h = self.W_s(H_s).view(N_s, self.n_heads, self.head_dim)
         Wt_h = self.W_t(H_t).view(N_t, self.n_heads, self.head_dim)
+
+        # Apply rank-specific metric G_r^{1/2}: covariantizes each projection
+        # so that the attention logit is metric-invariant across CC ranks.
+        if self.metric_s is not None:
+            Ws_h = Ws_h @ self.metric_s[rank_s]   # (N_s, n_heads, hd)
+            Wt_h = Wt_h @ self.metric_t[rank_t]   # (N_t, n_heads, hd)
+
         Ws_j = Ws_h[s_idx]   # (E, n_heads, hd)
         Wt_i = Wt_h[t_idx]   # (E, n_heads, hd)
 
@@ -659,6 +688,7 @@ class JacobianCorrectedBlock(nn.Module):
         ball_radius: float = 1.0,
         sigma: Optional[float] = None,
         learn_geometry: bool = True,
+        n_ranks: int = 1,
     ) -> None:
         super().__init__()
         assert d_out % n_heads == 0, "d_out must be divisible by n_heads"
@@ -685,6 +715,20 @@ class JacobianCorrectedBlock(nn.Module):
             self.register_buffer("log_t", torch.tensor(math.log(ball_radius)))
             self.register_buffer("sigma_param", torch.tensor(_sigma0))
 
+        # Per-rank metric matrices G_r^{1/2} — same construction as
+        # CCAttentionBlock; applied before the Jacobian-corrected logit.
+        self.n_ranks = n_ranks
+        if n_ranks > 1:
+            self.metric_s = nn.ParameterList([
+                nn.Parameter(torch.eye(self.head_dim)) for _ in range(n_ranks)
+            ])
+            self.metric_t = nn.ParameterList([
+                nn.Parameter(torch.eye(self.head_dim)) for _ in range(n_ranks)
+            ])
+        else:
+            self.metric_s = None
+            self.metric_t = None
+
     @property
     def ball_radius(self) -> float:
         return self.log_t.exp().item()
@@ -698,6 +742,8 @@ class JacobianCorrectedBlock(nn.Module):
         H_s: Tensor,
         H_t: Tensor,
         B: Tensor,
+        rank_s: int = 0,
+        rank_t: int = 0,
     ) -> Tuple[Tensor, Tensor]:
         """
         Returns
@@ -716,6 +762,12 @@ class JacobianCorrectedBlock(nn.Module):
 
         Ws_Hs = self.W_s(H_s).view(N_s, H, hd)
         Wt_Ht = self.W_t(H_t).view(N_t, H, hd)
+
+        # Apply rank-specific metric G_r^{1/2} (Cerrini index correction).
+        if self.metric_s is not None:
+            Ws_Hs = Ws_Hs @ self.metric_s[rank_s]
+            Wt_Ht = Wt_Ht @ self.metric_t[rank_t]
+
         Ws_src = Ws_Hs[src]   # (E, H, hd)
         Wt_tgt = Wt_Ht[tgt]   # (E, H, hd)
 
@@ -785,6 +837,7 @@ class HodgeletFilteredCCBlock(nn.Module):
             d_s_in=d_s_in + spec_proj_dim, d_t_in=d_t_in, d_out=d_out,
             n_heads=n_heads, dropout=dropout, negative_slope=negative_slope,
             ball_radius=ball_radius, sigma=sigma, learn_geometry=learn_geometry,
+            n_ranks=n_ranks,
         )
         self.k_eig = k_eig
         self.n_ranks = n_ranks
@@ -797,6 +850,7 @@ class HodgeletFilteredCCBlock(nn.Module):
         B: Tensor,
         eigenvalues: Tensor,   # (N_s, n_ranks, n_filtration_steps, k_eig)
         rank: int = 0,
+        rank_t: int = 0,
     ) -> Tuple[Tensor, Tensor]:
         evals_rank = eigenvalues[:, rank, :, :]
         gated      = self.soft_cutoff.gate_rank(evals_rank, rank)
@@ -804,7 +858,10 @@ class HodgeletFilteredCCBlock(nn.Module):
         filtered   = self.hodgelet(evals_mean)
         N_s, n_sc, n_h, k = filtered.shape
         spec_feat  = self.spec_proj(filtered.view(N_s, n_sc * n_h * k))
-        return self.attn_block(torch.cat([H_s, spec_feat], dim=-1), H_t, B)
+        return self.attn_block(
+            torch.cat([H_s, spec_feat], dim=-1), H_t, B,
+            rank_s=rank, rank_t=rank_t,
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
