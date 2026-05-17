@@ -90,6 +90,14 @@ from tope.engineering import (
     MCMCSearch,
 )
 
+# Dynamics scaffolding (NMA + free-energy stubs)
+from tope.dynamics import (
+    NormalModeAnalysis,
+    NMAConfig,
+    predict_delta_g_unfold,
+    predict_delta_g_dagger,
+)
+
 __all__ = [
     "__version__",
     # Models
@@ -132,4 +140,9 @@ __all__ = [
     "SaturationScan",
     "BeamSearch",
     "MCMCSearch",
+    # Dynamics
+    "NormalModeAnalysis",
+    "NMAConfig",
+    "predict_delta_g_unfold",
+    "predict_delta_g_dagger",
 ]
