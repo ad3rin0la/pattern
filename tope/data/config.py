@@ -217,7 +217,7 @@ EC_TOP_LEVEL = {
 # ── Pipeline defaults ─────────────────────────────────────────────────────────
 
 @dataclass
-class PipelineConfig:
+class PipelineConfig:  # noqa: D401
     """Configuration for a full curation run."""
 
     # Target dataset size
@@ -260,3 +260,8 @@ class PipelineConfig:
     # Output
     output_format: str = "parquet"       # parquet | csv | hdf5
     data_root: Path = DATA_ROOT
+
+
+# Backwards-compatible alias.
+CurationConfig = PipelineConfig
+

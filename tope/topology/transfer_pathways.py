@@ -36,11 +36,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    from torch_scatter import scatter_mean, scatter_add
-    HAS_TORCH_SCATTER = True
-except ImportError:
-    HAS_TORCH_SCATTER = False
+from tope._compat import scatter_mean, scatter_add
+HAS_TORCH_SCATTER = True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -526,6 +523,51 @@ def visualize_pathways(
         'nodes': pathway_node_coords,
         'n_pathway_edges': len(pathway_edge_coords),
         'n_pathway_nodes': len(pathway_node_coords),
+    }
+
+
+class TransferPathwayVisualizer:
+    """Thin OO wrapper around :func:`visualize_pathways`."""
+
+    def __init__(self, min_confidence: float = 0.5):
+        self.min_confidence = min_confidence
+
+    def __call__(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        edge_index: torch.Tensor,
+        coords: torch.Tensor,
+        pathway_type: PathwayType = PathwayType.ELECTRON_TRANSFER,
+    ) -> Dict[str, Any]:
+        return visualize_pathways(
+            predictions, edge_index, coords,
+            pathway_type=pathway_type, min_confidence=self.min_confidence,
+        )
+
+
+def extract_transfer_pathway_graph(
+    predictions: Dict[str, torch.Tensor],
+    edge_index: torch.Tensor,
+    pathway_type: PathwayType = PathwayType.ELECTRON_TRANSFER,
+    min_confidence: float = 0.5,
+) -> Dict[str, Any]:
+    """Return the (nodes, edges) subgraph above a confidence threshold."""
+    edge_probs = predictions['edge_probs']
+    node_probs = predictions['node_probs']
+    type_idx = int(pathway_type)
+
+    edge_conf = edge_probs[:, type_idx].detach().cpu().numpy()
+    node_conf = node_probs[:, type_idx].detach().cpu().numpy()
+    edge_mask = edge_conf >= min_confidence
+    node_mask = node_conf >= min_confidence
+
+    ei = edge_index.detach().cpu().numpy()
+    return {
+        'pathway_type': pathway_type.name,
+        'edge_index': ei[:, edge_mask],
+        'edge_confidence': edge_conf[edge_mask],
+        'node_indices': node_mask.nonzero()[0],
+        'node_confidence': node_conf[node_mask],
     }
 
 

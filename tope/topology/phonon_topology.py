@@ -827,6 +827,32 @@ def assign_vibrational_bins(
 # Section 6: Validation Utilities
 # ══════════════════════════════════════════════════════════════════════════════
 
+@dataclass
+class PhononTopologyFeatures:
+    """Summary features extracted from a phonon-topology analysis."""
+
+    localization_landscape: np.ndarray              # (N,) u_h per residue
+    hotspot_indices: np.ndarray                     # (k,) indices of top peaks
+    cofactor_bridge_count: int = 0
+    config: Optional[PhononTopologyConfig] = None
+
+
+def identify_thermal_hotspots(
+    u_h: np.ndarray,
+    top_k: int = 20,
+    threshold: Optional[float] = None,
+) -> np.ndarray:
+    """Return residue indices flagged as thermal hotspots.
+
+    A residue is a hotspot if its localization-landscape value sits in the
+    top `top_k`, or above `threshold` when supplied.
+    """
+    if threshold is not None:
+        return np.flatnonzero(u_h >= threshold)
+    k = min(top_k, u_h.shape[0])
+    return np.argsort(u_h)[-k:][::-1]
+
+
 def thermal_hotspot_recovery(
     model_attributions: np.ndarray,
     u_h: np.ndarray,

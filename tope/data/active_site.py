@@ -37,6 +37,28 @@ except ImportError:
     HAS_BIOPYTHON = False
 
 
+_STANDARD_AA: Set[str] = {
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+}
+
+_METAL_RESIDUES: Set[str] = {
+    "FE", "FE2", "FES", "ZN", "MG", "MN", "CU", "CU1", "CA", "CO", "NI",
+    "MO", "W", "K", "NA", "HEM", "HEC", "SF4", "F3S", "FCO", "FEO",
+}
+
+_AA_ELEMENTS: Dict[str, Set[str]] = {
+    "ALA": {"C", "N", "O"},  "ARG": {"C", "N", "O"}, "ASN": {"C", "N", "O"},
+    "ASP": {"C", "N", "O"},  "CYS": {"C", "N", "O", "S"},
+    "GLN": {"C", "N", "O"},  "GLU": {"C", "N", "O"}, "GLY": {"C", "N", "O"},
+    "HIS": {"C", "N", "O"},  "ILE": {"C", "N", "O"}, "LEU": {"C", "N", "O"},
+    "LYS": {"C", "N", "O"},  "MET": {"C", "N", "O", "S"},
+    "PHE": {"C", "N", "O"},  "PRO": {"C", "N", "O"}, "SER": {"C", "N", "O"},
+    "THR": {"C", "N", "O"},  "TRP": {"C", "N", "O"}, "TYR": {"C", "N", "O"},
+    "VAL": {"C", "N", "O"},
+}
+
+
 # ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -83,6 +105,29 @@ class ActiveSite:
     def ca_coords_array(self) -> np.ndarray:
         """Return (N, 3) Cα coordinate matrix."""
         return np.array([r.ca_coord for r in self.residues])
+
+    @property
+    def elements(self) -> List[str]:
+        """Unique heavy elements implied by the residue composition.
+
+        Residue-level extraction does not retain per-atom records, so we
+        approximate the element set from canonical sidechain composition.
+        """
+        elem_set: Set[str] = set()
+        for r in self.residues:
+            elem_set.update(_AA_ELEMENTS.get(r.residue_name.upper(), {"C"}))
+        return sorted(elem_set)
+
+    @property
+    def has_metal(self) -> bool:
+        """True if any residue is a metal/cofactor (non-standard amino acid)."""
+        for r in self.residues:
+            name = r.residue_name.upper()
+            if name in _METAL_RESIDUES:
+                return True
+            if name not in _STANDARD_AA:
+                return True
+        return False
 
 
 # ── Extractor ─────────────────────────────────────────────────────────────────
@@ -356,3 +401,21 @@ class ActiveSiteExtractor:
         coords = site.ca_coords_array()
         diff = coords[:, None, :] - coords[None, :, :]
         return np.sqrt((diff ** 2).sum(axis=-1))
+
+    @staticmethod
+    def compute_filtration_adjacencies(
+        site: ActiveSite,
+        radii: Optional[List[float]] = None,
+    ) -> Dict[float, np.ndarray]:
+        """Cα contact adjacency matrices at each filtration radius."""
+        from tope.data.config import FILTRATION_RADII
+
+        if radii is None:
+            radii = list(FILTRATION_RADII)
+        D = ActiveSiteExtractor.compute_ca_distance_matrix(site)
+        n = D.shape[0]
+        eye = np.eye(n, dtype=bool)
+        return {
+            float(r): ((D <= float(r)) & ~eye).astype(np.uint8)
+            for r in radii
+        }

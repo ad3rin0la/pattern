@@ -55,11 +55,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-try:
-    from torch_scatter import scatter_softmax
-    HAS_TORCH_SCATTER = True
-except ImportError:
-    HAS_TORCH_SCATTER = False
+from tope._compat import scatter_softmax
+HAS_TORCH_SCATTER = True
 
 # Differentiable Nijenhuis tensor norm — allosteric coupling signal.
 # Import is lazy so that cc_attention remains usable without the full

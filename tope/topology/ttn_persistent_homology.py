@@ -53,7 +53,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_scatter import scatter_add, scatter_mean
+from tope._compat import scatter_add, scatter_mean
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -212,7 +212,7 @@ class MultiParameterFiltration(nn.Module):
             eigenvalues: (batch_size, k)
         """
         from torch_geometric.nn import radius_graph
-        from torch_sparse import SparseTensor
+        from tope._compat import SparseTensor
 
         # Build radius graph
         edge_index = radius_graph(
