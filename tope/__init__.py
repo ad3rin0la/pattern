@@ -78,6 +78,18 @@ from tope.quantum import (
     VOIPSIRENConfig,
 )
 
+# Protein engineering engine
+from tope.engineering import (
+    EngineeringEngine,
+    EngineConfig,
+    Mutation,
+    AttributionScorer,
+    ToPEModelScorer,
+    SaturationScan,
+    BeamSearch,
+    MCMCSearch,
+)
+
 __all__ = [
     "__version__",
     # Models
@@ -111,4 +123,13 @@ __all__ = [
     "AttentiveVOIPEncoder",
     "VOIPSheafSectionBuilder",
     "VOIPSIRENConfig",
+    # Engineering
+    "EngineeringEngine",
+    "EngineConfig",
+    "Mutation",
+    "AttributionScorer",
+    "ToPEModelScorer",
+    "SaturationScan",
+    "BeamSearch",
+    "MCMCSearch",
 ]
