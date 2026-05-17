@@ -1,16 +1,16 @@
 """
-Physicochemical feature computation — Ioffe-style descriptors on residues.
+Physicochemical feature computation — Ioffe-style descriptors on atoms.
 
 Implements the eight-property descriptor scheme from Ioffe, Dobrotvorskii &
 Belozerskikh (1983), adapted from transition-metal-oxide surfaces to enzyme
-active-site residues. Each residue receives elemental descriptors derived from
-a representative heavy atom (VOIP, d-electron count, electron affinity,
-electronegativity, ionic radius) plus residue-level bulk descriptors
-(van-der-Waals volume, SASA, sidechain transfer enthalpy).
+active-site atoms. Each atom receives elemental descriptors (VOIP,
+d-electron count, electron affinity, electronegativity, ionic radius) and
+each residue contributes bulk descriptors (van-der-Waals volume, SASA,
+sidechain transfer enthalpy).
 
-Note: the upstream `ActiveSite` was refactored to residue-level extraction, so
-features are now computed per residue rather than per atom. Output shapes
-(coords, feature_matrix, catalytic_mask) are preserved for downstream callers.
+Features are attached as sheaf sections in Phase 2 (persistent sheaf
+Laplacian construction). For Phase 1 they serve as flat feature vectors
+for baseline models and as ground-truth for inverse-attribution validation.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from tope.data.active_site import ActiveSite, ResidueRecord
+from tope.data.active_site import ActiveSite, AtomRecord
 from tope.data.config import (
     ELEMENT_PROPERTIES,
     IOFFE_PROPERTY_KEYS,
@@ -30,25 +30,23 @@ from tope.data.config import (
 
 logger = logging.getLogger(__name__)
 
+# Optional SASA computation via FreeSASA.
+try:
+    import freesasa
 
-# Representative heavy-atom element per amino acid. Used to source the five
-# elemental Ioffe descriptors from ELEMENT_PROPERTIES when only residue-level
-# information is available.
-_REPRESENTATIVE_ELEMENT: Dict[str, str] = {
-    "ALA": "C", "ARG": "N", "ASN": "N", "ASP": "O", "CYS": "S",
-    "GLN": "N", "GLU": "O", "GLY": "C", "HIS": "N", "ILE": "C",
-    "LEU": "C", "LYS": "N", "MET": "S", "PHE": "C", "PRO": "C",
-    "SER": "O", "THR": "O", "TRP": "N", "TYR": "O", "VAL": "C",
-}
+    HAS_FREESASA = True
+except ImportError:
+    HAS_FREESASA = False
 
 
 # ── Feature vector ────────────────────────────────────────────────────────────
 
 @dataclass
-class ResidueFeatures:
-    """Feature vector for a single residue in the active site."""
+class AtomFeatures:
+    """Feature vector for a single atom in the active site."""
 
-    residue_index: int
+    atom_index: int
+    element: str
     residue_name: str
     residue_id: str
     is_catalytic: bool
@@ -60,32 +58,20 @@ class ResidueFeatures:
         return float(self.properties[idx])
 
 
-# Backwards-compatible alias for code that still references the old name.
-AtomFeatures = ResidueFeatures
-
-
 @dataclass
 class ActiveSiteFeatures:
     """Full feature matrix for an active-site environment."""
 
     pdb_id: str
     ec_number: str
-    residue_features: List[ResidueFeatures] = field(default_factory=list)
+    atom_features: List[AtomFeatures] = field(default_factory=list)
     coords: Optional[np.ndarray] = None           # (N, 3)
     feature_matrix: Optional[np.ndarray] = None   # (N, 8)
     catalytic_mask: Optional[np.ndarray] = None   # (N,) bool
 
     @property
-    def n_residues(self) -> int:
-        return len(self.residue_features)
-
-    @property
-    def n_atoms(self) -> int:  # legacy alias
-        return self.n_residues
-
-    @property
-    def atom_features(self) -> List[ResidueFeatures]:  # legacy alias
-        return self.residue_features
+    def n_atoms(self) -> int:
+        return len(self.atom_features)
 
     def to_arrays(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return (coords, features, catalytic_mask) as numpy arrays."""
@@ -98,7 +84,7 @@ class ActiveSiteFeatures:
 # ── Feature computer ──────────────────────────────────────────────────────────
 
 class FeatureComputer:
-    """Compute Ioffe-style physicochemical descriptors for active-site residues."""
+    """Compute Ioffe-style physicochemical descriptors for active-site atoms."""
 
     def __init__(
         self,
@@ -107,33 +93,36 @@ class FeatureComputer:
         compute_sasa: bool = True,
         normalise: bool = True,
     ):
-        self.element_props = element_properties or ELEMENT_PROPERTIES
+        # Case-insensitive element lookup: keep both upper and title forms.
+        base_elem = element_properties or ELEMENT_PROPERTIES
+        self.element_props = {k.upper(): v for k, v in base_elem.items()}
         self.residue_props = residue_properties or RESIDUE_PROPERTIES
-        # SASA computation requires per-atom records; not available at the
-        # residue-level abstraction. Kept as a flag for API compatibility.
-        self.compute_sasa = compute_sasa
+        self.compute_sasa = compute_sasa and HAS_FREESASA
         self.normalise = normalise
 
     def compute(self, active_site: ActiveSite) -> ActiveSiteFeatures:
-        """Compute the 8-element Ioffe descriptor for every residue."""
-        res_feats: List[ResidueFeatures] = []
+        """Compute the 8-element Ioffe descriptor for every atom."""
+        atom_feats: List[AtomFeatures] = []
         coords_list: List[np.ndarray] = []
         feat_rows: List[np.ndarray] = []
         cat_mask: List[bool] = []
 
-        for i, residue in enumerate(active_site.residues):
-            vec = self._residue_vector(residue)
-            rf = ResidueFeatures(
-                residue_index=i,
-                residue_name=residue.residue_name,
-                residue_id=residue.residue_id,
-                is_catalytic=residue.is_catalytic,
+        sasa_map = self._compute_sasa_map(active_site) if self.compute_sasa else {}
+
+        for i, atom in enumerate(active_site.atoms):
+            vec = self._atom_vector(atom, sasa_map)
+            af = AtomFeatures(
+                atom_index=i,
+                element=atom.element,
+                residue_name=atom.residue_name,
+                residue_id=atom.residue_id,
+                is_catalytic=atom.is_catalytic,
                 properties=vec,
             )
-            res_feats.append(rf)
-            coords_list.append(residue.ca_coord)
+            atom_feats.append(af)
+            coords_list.append(atom.coord)
             feat_rows.append(vec)
-            cat_mask.append(residue.is_catalytic)
+            cat_mask.append(atom.is_catalytic)
 
         coords = np.array(coords_list, dtype=np.float64) if coords_list else np.empty((0, 3))
         features = np.array(feat_rows, dtype=np.float64) if feat_rows else np.empty((0, 8))
@@ -145,17 +134,17 @@ class FeatureComputer:
         result = ActiveSiteFeatures(
             pdb_id=active_site.pdb_id,
             ec_number=active_site.ec_number,
-            residue_features=res_feats,
+            atom_features=atom_feats,
             coords=coords,
             feature_matrix=features,
             catalytic_mask=mask,
         )
 
         logger.debug(
-            "%s: computed %d-dim features for %d residues (%d catalytic)",
+            "%s: computed %d-dim features for %d atoms (%d catalytic)",
             active_site.pdb_id,
             features.shape[1] if features.ndim == 2 else 0,
-            result.n_residues,
+            result.n_atoms,
             int(mask.sum()),
         )
         return result
@@ -198,12 +187,15 @@ class FeatureComputer:
 
     # ── Private ──────────────────────────────────────────────────────────
 
-    def _residue_vector(self, residue: ResidueRecord) -> np.ndarray:
-        """Build the 8-element property vector for one residue."""
-        res_name = residue.residue_name.upper()
-        elem = _REPRESENTATIVE_ELEMENT.get(res_name, "C")
+    def _atom_vector(
+        self,
+        atom: AtomRecord,
+        sasa_map: Dict[str, float],
+    ) -> np.ndarray:
+        """Build the 8-element property vector for one atom."""
+        elem = atom.element.upper()
         elem_data = self.element_props.get(elem, {})
-        res_data = self.residue_props.get(res_name, {})
+        res_data = self.residue_props.get(atom.residue_name.upper(), {})
 
         voip = elem_data.get("voip", 0.0)
         n_d = elem_data.get("n_d_electrons", 0.0)
@@ -211,7 +203,7 @@ class FeatureComputer:
         en = elem_data.get("electronegativity", 0.0)
         ir = elem_data.get("ionic_radius", 0.0)
         rv = res_data.get("residue_volume", 0.0)
-        sasa = 0.0  # not available at residue-level abstraction
+        sasa = sasa_map.get(atom.residue_id, 0.0)
         seh = res_data.get("sidechain_enthalpy", 0.0)
 
         return np.array([voip, n_d, ea, en, ir, rv, sasa, seh], dtype=np.float64)
@@ -222,3 +214,31 @@ class FeatureComputer:
         std = features.std(axis=0)
         std[std < 1e-12] = 1.0
         return (features - mean) / std
+
+    def _compute_sasa_map(self, active_site: ActiveSite) -> Dict[str, float]:
+        """Compute per-residue SASA using FreeSASA (if available)."""
+        if not HAS_FREESASA:
+            return {}
+
+        try:
+            struct = freesasa.Structure()
+            for atom in active_site.atoms:
+                struct.addAtom(
+                    atom.name,
+                    atom.residue_name,
+                    str(atom.residue_number),
+                    atom.chain_id,
+                    float(atom.coord[0]),
+                    float(atom.coord[1]),
+                    float(atom.coord[2]),
+                )
+
+            result = freesasa.calc(struct)
+            sasa_map: Dict[str, float] = {}
+            for chain_key, residues in result.residueAreas().items():
+                for resnum_str, area in residues.items():
+                    sasa_map[f"{chain_key}:{resnum_str}"] = area.total
+            return sasa_map
+        except Exception as exc:
+            logger.debug("FreeSASA computation failed: %s", exc)
+            return {}

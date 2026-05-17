@@ -47,6 +47,10 @@ _METAL_RESIDUES: Set[str] = {
     "MO", "W", "K", "NA", "HEM", "HEC", "SF4", "F3S", "FCO", "FEO",
 }
 
+_METAL_ELEMENTS: Set[str] = {
+    "FE", "ZN", "MG", "MN", "CU", "CA", "CO", "NI", "MO", "W", "K", "NA",
+}
+
 _AA_ELEMENTS: Dict[str, Set[str]] = {
     "ALA": {"C", "N", "O"},  "ARG": {"C", "N", "O"}, "ASN": {"C", "N", "O"},
     "ASP": {"C", "N", "O"},  "CYS": {"C", "N", "O", "S"},
@@ -62,6 +66,25 @@ _AA_ELEMENTS: Dict[str, Set[str]] = {
 # ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
+class AtomRecord:
+    """One heavy atom in the active site."""
+
+    name: str                # atom name (e.g. "CA", "NE2", "OD1")
+    element: str             # element symbol (e.g. "C", "N", "O", "S", "FE")
+    coord: np.ndarray        # (3,) Cartesian coordinate
+    chain_id: str
+    residue_name: str
+    residue_number: int
+    b_factor: float = 0.0
+    is_catalytic: bool = False
+    role: str = ""
+
+    @property
+    def residue_id(self) -> str:
+        return f"{self.chain_id}:{self.residue_name}{self.residue_number}"
+
+
+@dataclass
 class ResidueRecord:
     """One residue in the active-site environment."""
 
@@ -72,7 +95,8 @@ class ResidueRecord:
     mean_b_factor: float = 0.0
     n_atoms: int = 0
     is_catalytic: bool = False
-    role: str = ""           # M-CSA role if catalytic
+    role: str = ""
+    atoms: List[AtomRecord] = field(default_factory=list)
 
     @property
     def residue_id(self) -> str:
@@ -107,12 +131,17 @@ class ActiveSite:
         return np.array([r.ca_coord for r in self.residues])
 
     @property
-    def elements(self) -> List[str]:
-        """Unique heavy elements implied by the residue composition.
+    def atoms(self) -> List[AtomRecord]:
+        """Flat list of every atom across all residues."""
+        return [a for r in self.residues for a in r.atoms]
 
-        Residue-level extraction does not retain per-atom records, so we
-        approximate the element set from canonical sidechain composition.
-        """
+    @property
+    def elements(self) -> List[str]:
+        """Sorted unique heavy elements present in the active site."""
+        atoms = self.atoms
+        if atoms:
+            return sorted({a.element for a in atoms})
+        # Fallback when atoms weren't recorded (older serialised sites).
         elem_set: Set[str] = set()
         for r in self.residues:
             elem_set.update(_AA_ELEMENTS.get(r.residue_name.upper(), {"C"}))
@@ -120,12 +149,15 @@ class ActiveSite:
 
     @property
     def has_metal(self) -> bool:
-        """True if any residue is a metal/cofactor (non-standard amino acid)."""
+        """True if any atom is a transition/alkaline-earth metal."""
+        for a in self.atoms:
+            if a.element.upper() in _METAL_ELEMENTS:
+                return True
         for r in self.residues:
             name = r.residue_name.upper()
             if name in _METAL_RESIDUES:
                 return True
-            if name not in _STANDARD_AA:
+            if name not in _STANDARD_AA and not r.atoms:
                 return True
         return False
 
@@ -239,6 +271,11 @@ class ActiveSiteExtractor:
                 continue
 
             is_cat = key in matched_set
+            role = cat_roles.get(key, "")
+            atom_records: List[AtomRecord] = info.get("atoms", [])
+            for a in atom_records:
+                a.is_catalytic = is_cat
+                a.role = role
             rec = ResidueRecord(
                 chain_id=key[0],
                 residue_name=info["resname"],
@@ -247,7 +284,8 @@ class ActiveSiteExtractor:
                 mean_b_factor=info["mean_b"],
                 n_atoms=info["n_atoms"],
                 is_catalytic=is_cat,
-                role=cat_roles.get(key, ""),
+                role=role,
+                atoms=atom_records,
             )
             records.append(rec)
             if is_cat:
@@ -383,12 +421,30 @@ class ActiveSiteExtractor:
                 b_factors = [a.get_bfactor() for a in atoms]
                 mean_b = float(np.mean(b_factors)) if b_factors else 0.0
 
+                atom_records: List[AtomRecord] = []
+                for a in atoms:
+                    elem = (a.element or "").strip()
+                    if not elem:
+                        # Fallback: first alpha char of atom name.
+                        name = a.get_name()
+                        elem = next((c for c in name if c.isalpha()), "C")
+                    atom_records.append(AtomRecord(
+                        name=a.get_name(),
+                        element=elem.upper(),
+                        coord=np.array(a.get_vector().get_array(), dtype=np.float64),
+                        chain_id=chain_id,
+                        residue_name=resname,
+                        residue_number=resnum,
+                        b_factor=float(a.get_bfactor()),
+                    ))
+
                 key = (chain_id, resnum)
                 residue_lookup[key] = {
                     "resname": resname,
                     "ca_coord": ca_coord,
                     "mean_b": mean_b,
                     "n_atoms": len(atoms),
+                    "atoms": atom_records,
                 }
 
         return residue_lookup, auth_map
