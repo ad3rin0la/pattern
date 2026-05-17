@@ -141,6 +141,69 @@ def test_tope_model_scorer_with_user_callable():
     assert "delta_n_residues" in res.breakdown
 
 
+def test_thermal_composite_scorer_factors():
+    """ThermalCompositeScorer cleanly decomposes into f_folded · Arrhenius · γ."""
+    from tope.engineering import (
+        ThermalCompositeScorer, BoltzmannFoldedFraction, ConstantEa,
+        ConstantCooperativity, R_KCAL,
+    )
+    site = _make_site()
+
+    # WT has ΔG_unfold = 5 kcal/mol, mutant has 8 (more stable).
+    def dG(s, T):
+        return 8.0 if any(r.residue_name == "ALA" for r in s.residues
+                          if r.residue_number == 240) else 5.0
+
+    # WT Ea = 15, mutant Ea = 13 (lower barrier — kcat goes up).
+    def ea(s, T):
+        return 13.0 if any(r.residue_name == "ALA" for r in s.residues
+                           if r.residue_number == 240) else 15.0
+
+    T = 310.0
+    scorer = ThermalCompositeScorer(
+        folded=BoltzmannFoldedFraction(delta_g_unfold=dG),
+        ea=ea,
+        coop=ConstantCooperativity(gamma=1.0),
+        T=T,
+    )
+    res = scorer.score(site, [Mutation("A", 240, "ALA")])
+
+    expected_arr = (15.0 - 13.0) / (R_KCAL * T)
+    assert abs(res.breakdown["log_arrhenius_gain"] - expected_arr) < 1e-9
+    assert res.breakdown["log_f_folded_ratio"] > 0  # more stable mutant
+    assert res.breakdown["log_gamma_coop_ratio"] == 0.0
+    assert res.score > 0  # net beneficial
+
+
+def test_thermal_composite_kcat_curve():
+    """kcat_curve sweeps T and returns one entry per temperature."""
+    from tope.engineering import ThermalCompositeScorer
+    site = _make_site()
+    scorer = ThermalCompositeScorer()
+    curve = scorer.kcat_curve(site, [Mutation("A", 240, "ALA")],
+                              temperatures_K=[280., 298.15, 320., 350.])
+    assert len(curve) == 4
+    assert all("T_K" in row and "log_kcat_ratio" in row for row in curve)
+    # With all constant stubs the score is exactly zero everywhere.
+    assert all(abs(row["log_kcat_ratio"]) < 1e-9 for row in curve)
+
+
+def test_thermal_composite_in_engine():
+    """ThermalCompositeScorer plugs into EngineeringEngine like any scorer."""
+    from tope.engineering import ThermalCompositeScorer
+    site = _make_site()
+    engine = EngineeringEngine(
+        scorer=ThermalCompositeScorer(T=310.0),
+        search=SaturationScan(top_k=3),
+        cfg=EngineConfig(
+            target_amino_acids=["ALA", "VAL"],
+            saturation_top_k=3, temperature_K=310.0,
+        ),
+    )
+    out = engine.propose(site)
+    assert len(out) == 3
+
+
 def test_engine_propose_ensemble():
     site = _make_site()
     cfg = EngineConfig(

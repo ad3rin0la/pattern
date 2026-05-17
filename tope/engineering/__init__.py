@@ -49,6 +49,16 @@ from tope.engineering.search import (
     MCMCSearch,
 )
 from tope.engineering.engine import EngineeringEngine
+from tope.engineering.thermal import (
+    ThermalCompositeScorer,
+    BoltzmannFoldedFraction,
+    ConstantEa,
+    ConstantCooperativity,
+    FoldedFractionScorer,
+    ArrheniusEaScorer,
+    CooperativityScorer,
+    R_KCAL,
+)
 
 __all__ = [
     "EngineConfig",
@@ -65,4 +75,13 @@ __all__ = [
     "BeamSearch",
     "MCMCSearch",
     "EngineeringEngine",
+    # Thermal composite
+    "ThermalCompositeScorer",
+    "BoltzmannFoldedFraction",
+    "ConstantEa",
+    "ConstantCooperativity",
+    "FoldedFractionScorer",
+    "ArrheniusEaScorer",
+    "CooperativityScorer",
+    "R_KCAL",
 ]

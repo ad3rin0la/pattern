@@ -40,6 +40,9 @@ class EngineConfig:
     # When the scorer returns a scalar, "maximize" treats higher as better.
     objective: str = "maximize"   # {"maximize", "minimize"}
 
+    # ── Thermodynamics ────────────────────────────────────────────────────
+    temperature_K: float = 298.15  # default reference T for ThermalCompositeScorer
+
     # ── Misc ──────────────────────────────────────────────────────────────
     return_top_n: int = 50
     verbose: bool = False
