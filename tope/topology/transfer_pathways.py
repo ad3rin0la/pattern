@@ -602,3 +602,35 @@ class TransferPathwayModule(nn.Module):
             pathways[pathway_type.name.lower()] = type_pathways
 
         return pathways
+
+
+# ── Compatibility shims ──────────────────────────────────────────────────────
+
+class TransferPathwayVisualizer:
+    """Thin wrapper around :func:`visualize_pathways` exposing a class API."""
+
+    def __init__(self, **defaults):
+        self.defaults = defaults
+
+    def __call__(self, *args, **kwargs):
+        merged = {**self.defaults, **kwargs}
+        return visualize_pathways(*args, **merged)
+
+
+def extract_transfer_pathway_graph(
+    node_embeddings,
+    edge_index,
+    distances,
+    u_h,
+    pathway_type: "PathwayType",
+    config: "TransferPathwayConfig | None" = None,
+):
+    """Run the pathway head and return predicted pathways for a given type.
+
+    Convenience entry point that constructs a :class:`TransferPathwayHead`
+    on demand and dispatches to :meth:`predict_pathways`.
+    """
+    head = TransferPathwayHead(config=config or TransferPathwayConfig())
+    return head.predict_pathways(
+        node_embeddings, edge_index, distances, u_h, pathway_type
+    )

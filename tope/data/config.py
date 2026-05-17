@@ -260,3 +260,27 @@ class PipelineConfig:
     # Output
     output_format: str = "parquet"       # parquet | csv | hdf5
     data_root: Path = DATA_ROOT
+
+
+class CurationConfig(PipelineConfig):
+    """User-facing curation config.
+
+    Thin wrapper over :class:`PipelineConfig` that accepts the kwarg names
+    used in the README and CLI (``output_dir``, ``include_kinetics``).
+    """
+
+    def __init__(
+        self,
+        output_dir: str | Path | None = None,
+        include_kinetics: bool | None = None,
+        **kwargs,
+    ):
+        if output_dir is not None:
+            kwargs.setdefault("data_root", Path(output_dir))
+        if include_kinetics is not None:
+            kwargs.setdefault("fetch_kinetics", include_kinetics)
+        super().__init__(**kwargs)
+
+    @property
+    def output_dir(self) -> Path:
+        return self.data_root

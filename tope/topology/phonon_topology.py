@@ -1070,3 +1070,24 @@ def extend_enzyme_pcc_with_phonon_topology(
     enzyme_pcc['vibrational_thresholds'] = vib_thresholds
 
     return enzyme_pcc
+
+
+# ── Compatibility aliases ────────────────────────────────────────────────────
+
+#: Alias for backwards-compat with code/tests that expect this name.
+identify_thermal_hotspots = thermal_hotspot_recovery
+
+
+class PhononTopologyFeatures:
+    """Convenience wrapper bundling phonon-topology features for an enzyme PCC.
+
+    Thin facade over :func:`extend_enzyme_pcc_with_phonon_topology` and
+    :class:`EnzymePCCPhononExtension`; provided so importers can refer to a
+    single feature-extraction class.
+    """
+
+    def __init__(self, config: PhononTopologyConfig | None = None):
+        self.config = config or PhononTopologyConfig()
+
+    def __call__(self, enzyme_pcc: Dict[str, Any]) -> Dict[str, Any]:
+        return extend_enzyme_pcc_with_phonon_topology(enzyme_pcc, self.config)

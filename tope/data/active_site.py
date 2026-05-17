@@ -40,6 +40,29 @@ except ImportError:
 # ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
+class AtomRecord:
+    """One atom in the active-site environment.
+
+    Stub used by :mod:`tope.data.features` for atom-level Ioffe descriptors.
+    The current extractor populates residue-level records only; atom-level
+    code paths in ``features.py`` are not exercised by the residue pipeline.
+    """
+
+    chain_id: str
+    residue_name: str
+    residue_number: int
+    name: str = ""
+    element: str = ""
+    coord: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    b_factor: float = 0.0
+    is_catalytic: bool = False
+
+    @property
+    def residue_id(self) -> str:
+        return f"{self.chain_id}:{self.residue_name}{self.residue_number}"
+
+
+@dataclass
 class ResidueRecord:
     """One residue in the active-site environment."""
 
