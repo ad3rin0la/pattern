@@ -48,7 +48,10 @@ from tope.data.active_site import ActiveSite
 from tope.dynamics.nma import NMAConfig, NormalModeAnalysis, KB_KCAL
 from tope.dynamics.spd import (
     gaussian_chain_covariance,
+    gaussian_entropy_change_basis_free,
     gaussian_entropy_change_from_hessians,
+    gaussian_entropy_change_shape_and_offset,
+    gaussian_entropy_change_shape_invariant,
     path_laplacian,
 )
 
@@ -70,6 +73,22 @@ class FreeEnergyConfig:
 
     # NMA parameters used internally.
     nma_cfg: NMAConfig = field(default_factory=NMAConfig)
+
+    # How to compute the log-det ratio for ΔS_unfold:
+    #   "sorted"     — sorted-paired eigenvalue heuristic. Default.
+    #                  Σ²-sensitive (note #1) but has a guaranteed sign
+    #                  from Loewner order. ΔS_shape under sorted is
+    #                  *identically zero* (the whole signal is offset).
+    #   "basis_free" — project both Hessians onto the folded non-rigid
+    #                  basis and take log det there. Captures basis
+    #                  coupling that sorted misses; still σ²-sensitive.
+    #   "shape_only" — geometric-mean-normalised basis-free log-det.
+    #                  Invariant under uniform γ/σ² rescaling, but the
+    #                  *sign* of the result depends on subspace alignment
+    #                  (whether folded modes hit stiff or floppy unfolded
+    #                  modes). Do NOT use as ΔG_unfold input until the
+    #                  downstream head can handle indeterminate ΔS sign.
+    entropy_mode: str = "sorted"
 
     # ΔG‡: stub-constant activation energy (kcal/mol) until a trained
     # head lands.
@@ -105,27 +124,45 @@ def predict_delta_g_unfold(
 
     # ── ΔS_unfold via intrinsic log-det ratio on SPD(3N − 6) ────────────
     # Folded Hessian: full ANM. Unfolded Hessian: path-graph Laplacian
-    # of an ideal Gaussian chain, rescaled to share units with the
-    # folded ANM (γ ↦ 1/σ² implies the unfolded scale is the inverse
-    # segment variance times the chain Laplacian). We compare *non-rigid*
-    # eigenvalues only: 6 zero modes are stripped from H_fold, 3
-    # translation modes from H_unfold, then spectra are sorted-and-paired
-    # by stiffness so the comparison is between corresponding modes.
+    # of an ideal Gaussian chain. Three modes for combining the spectra
+    # are selectable via cfg.entropy_mode (see FreeEnergyConfig).
     nma = NormalModeAnalysis(coords, cfg=cfg.nma_cfg)
-    H_fold_eigs = np.linalg.eigvalsh(nma.H)
-    H_fold_nonzero = H_fold_eigs[H_fold_eigs > cfg.nma_cfg.eigenvalue_floor]
-
     n_res = len(active_site.residues)
     H_unfold_1d = (1.0 / cfg.segment_var_A2) * path_laplacian(n_res)
     H_unfold_full = np.kron(H_unfold_1d, np.eye(3))
-    H_unfold_eigs = np.linalg.eigvalsh(H_unfold_full)
-    H_unfold_nonzero = H_unfold_eigs[H_unfold_eigs > cfg.nma_cfg.eigenvalue_floor]
 
-    # ½ log(det Σ_unf / det Σ_fold) = ½ log(Π λ_fold / Π λ_unfold).
-    log_ratio = gaussian_entropy_change_from_hessians(
-        H_fold_nonzero, H_unfold_nonzero, floor=cfg.nma_cfg.eigenvalue_floor,
-    )
-    dS = KB_KCAL * log_ratio  # kcal/(mol·K). Sign comes from Loewner order.
+    if cfg.entropy_mode == "basis_free":
+        log_ratio = gaussian_entropy_change_basis_free(
+            nma.H, H_unfold_full,
+            n_trivial_fold=cfg.nma_cfg.n_trivial_modes,
+            n_trivial_unfold=3,
+            floor=cfg.nma_cfg.eigenvalue_floor,
+        )
+    elif cfg.entropy_mode == "shape_only":
+        # Geometric-mean-normalised basis-free log-det. Invariant
+        # under uniform rescaling of either H_fold or H_unfold ⇒ γ
+        # and σ² calibration uncertainty cannot bias this signal.
+        log_ratio = gaussian_entropy_change_shape_invariant(
+            nma.H, H_unfold_full,
+            n_trivial_fold=cfg.nma_cfg.n_trivial_modes,
+            floor=cfg.nma_cfg.eigenvalue_floor,
+        )
+    elif cfg.entropy_mode == "sorted":
+        H_fold_eigs = np.linalg.eigvalsh(nma.H)
+        H_fold_nonzero = H_fold_eigs[H_fold_eigs > cfg.nma_cfg.eigenvalue_floor]
+        H_unfold_eigs = np.linalg.eigvalsh(H_unfold_full)
+        H_unfold_nonzero = H_unfold_eigs[H_unfold_eigs > cfg.nma_cfg.eigenvalue_floor]
+        log_ratio = gaussian_entropy_change_from_hessians(
+            H_fold_nonzero, H_unfold_nonzero,
+            floor=cfg.nma_cfg.eigenvalue_floor,
+        )
+    else:
+        raise ValueError(
+            f"entropy_mode must be one of "
+            f"{{'sorted', 'basis_free', 'shape_only'}}, got {cfg.entropy_mode!r}"
+        )
+
+    dS = KB_KCAL * log_ratio  # kcal/(mol·K). Sign from Loewner order.
 
     return float(dH - T * dS)
 

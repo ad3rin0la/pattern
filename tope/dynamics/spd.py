@@ -35,7 +35,7 @@ supervised head needs to be calibrated).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 from scipy.linalg import expm, logm
@@ -194,5 +194,141 @@ def gaussian_entropy_change_from_hessians(
 
     Returned in units of ``log`` (multiply by ``k_B`` to get entropy in
     energy/T units).
+
+    This is the **sorted-paired heuristic** — stiffest-to-stiffest
+    matching after stripping nulls. It assumes the stiffness ordering
+    of folded modes corresponds to that of unfolded modes, which is
+    true only in spirit. For a guarantee that the comparison is on a
+    common subspace, use :func:`gaussian_entropy_change_basis_free`.
     """
     return 0.5 * log_det_ratio_from_eigvals(H_fold_eigs, H_unfold_eigs, floor=floor)
+
+
+def gaussian_entropy_change_basis_free(
+    H_fold: np.ndarray,
+    H_unfold: np.ndarray,
+    n_trivial_fold: int = 6,
+    n_trivial_unfold: int = 3,
+    floor: float = 1e-12,
+) -> float:
+    """Basis-independent ΔS_unfold ∝ ½ log(det Σ_unfold / det Σ_fold).
+
+    The folded Hessian has ``n_trivial_fold`` rigid-body zero modes
+    (typically 6 for a generic 3D body), the unfolded path-Laplacian
+    has ``n_trivial_unfold`` (typically 3 translations). The clean
+    comparison projects both operators onto the **folded non-rigid
+    subspace** — the (3N − n_trivial_fold)-dimensional intersection
+    where both are SPD — and takes the log-det ratio there.
+
+    Concretely: let ``P`` be the (3N) × (3N − n_trivial_fold) matrix of
+    eigenvectors of ``H_fold`` with non-zero eigenvalue. Then both
+    ``Pᵀ H_fold P`` and ``Pᵀ H_unfold P`` are SPD on the same
+    coordinate system, and the result
+
+        ½ [log det(Pᵀ H_fold P) − log det(Pᵀ H_unfold P)]
+
+    is what the SPD log-det ratio actually computes — no pairing
+    heuristic. ``n_trivial_unfold`` is accepted but not used directly;
+    the unfolded operator is restricted by ``P`` and any residual
+    near-zero eigenvalues are floored.
+    """
+    H_fold = 0.5 * (H_fold + H_fold.T)
+    H_unfold = 0.5 * (H_unfold + H_unfold.T)
+    eigvals, eigvecs = np.linalg.eigh(H_fold)
+    n = H_fold.shape[0]
+    # Strip the first ``n_trivial_fold`` zero modes.
+    P = eigvecs[:, n_trivial_fold:]                      # (n, n - n_trivial_fold)
+    lam_fold = np.maximum(eigvals[n_trivial_fold:], floor)
+
+    H_unfold_restricted = P.T @ H_unfold @ P
+    H_unfold_restricted = 0.5 * (H_unfold_restricted + H_unfold_restricted.T)
+    lam_unf = np.maximum(np.linalg.eigvalsh(H_unfold_restricted), floor)
+
+    return 0.5 * (np.log(lam_fold).sum() - np.log(lam_unf).sum())
+
+
+def gaussian_entropy_change_shape_and_offset(
+    H_fold_eigs: np.ndarray,
+    H_unfold_eigs: np.ndarray,
+    floor: float = 1e-12,
+) -> Tuple[float, float]:
+    """Sorted-pairing decomposition of ΔS_unfold into shape + offset.
+
+    ::
+
+        ΔS_unfold = ΔS_shape + (k/2) · log(ḡ_fold / ḡ_unf)
+
+    **Key finding from actually computing this:** under the sorted-
+    pairing formula, ``ΔS_shape`` is *identically zero*. Log-det of a
+    paired spectrum only depends on its geometric mean — by definition
+    a centred log-spectrum sums to zero — so the entire log-det ratio
+    is the offset term ``(k/2)·log(ḡ_fold/ḡ_unf)``.
+
+    Two consequences worth absorbing:
+
+    1. The sorted-pairing pathway is *entirely* a unit offset. There is
+       no scale-invariant signal in it. Whatever ΔG_unfold predicts
+       under ``entropy_mode="sorted"`` will respond to γ and σ²
+       rescaling on a one-for-one basis.
+    2. To get a non-trivial scale-invariant signal you need a
+       comparison that breaks paired symmetry. The basis-free
+       projection ``Pᵀ H_unfold P`` does this — see
+       :func:`gaussian_entropy_change_shape_invariant`.
+
+    Returns
+    -------
+    shape, offset : both in units of ``log`` (multiply by ``k_B`` for
+        entropy in energy/T). ``shape`` is mathematically ≡ 0 for any
+        inputs and is returned only for diagnostic completeness.
+    """
+    a = np.sort(np.maximum(np.asarray(H_fold_eigs, dtype=np.float64), floor))[::-1]
+    b = np.sort(np.maximum(np.asarray(H_unfold_eigs, dtype=np.float64), floor))[::-1]
+    k = min(a.shape[0], b.shape[0])
+    a_k, b_k = a[:k], b[:k]
+
+    log_g_a = np.log(a_k).mean()
+    log_g_b = np.log(b_k).mean()
+    a_tilde = np.log(a_k) - log_g_a
+    b_tilde = np.log(b_k) - log_g_b
+
+    shape = 0.5 * float(a_tilde.sum() - b_tilde.sum())   # = 0 identically
+    offset = 0.5 * k * float(log_g_a - log_g_b)
+    return shape, offset
+
+
+def gaussian_entropy_change_shape_invariant(
+    H_fold: np.ndarray,
+    H_unfold: np.ndarray,
+    n_trivial_fold: int = 6,
+    floor: float = 1e-12,
+) -> float:
+    """Scale-invariant ΔS_unfold via geometric-mean-normalised basis-
+    free log-det ratio.
+
+    Each Hessian's non-rigid spectrum is rescaled to have unit
+    geometric mean *before* the basis-free projection. Both ``γ`` and
+    ``σ²`` factor out by construction — multiplying either ``H`` by
+    a positive scalar leaves the result invariant.
+
+    Unlike the sorted-pairing variant, this *does* depend on the
+    interaction between the folded and unfolded eigenbases (through
+    ``Pᵀ H_unfold P``), so the rescale-invariant signal is non-trivial.
+    This is what should be trained against when γ is uncalibrated.
+    """
+    eigs_f = np.linalg.eigvalsh(0.5 * (H_fold + H_fold.T))
+    nz_f = eigs_f[eigs_f > floor]
+    if nz_f.size == 0:
+        return 0.0
+    g_f = float(np.exp(np.log(nz_f).mean()))
+
+    eigs_u = np.linalg.eigvalsh(0.5 * (H_unfold + H_unfold.T))
+    nz_u = eigs_u[eigs_u > floor]
+    if nz_u.size == 0:
+        return 0.0
+    g_u = float(np.exp(np.log(nz_u).mean()))
+
+    return gaussian_entropy_change_basis_free(
+        H_fold / g_f, H_unfold / g_u,
+        n_trivial_fold=n_trivial_fold,
+        floor=floor,
+    )

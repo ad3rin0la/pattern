@@ -41,6 +41,9 @@ from tope.dynamics.spd import (
     relative_entropy_spd,
     log_det_ratio_from_eigvals,
     gaussian_entropy_change_from_hessians,
+    gaussian_entropy_change_basis_free,
+    gaussian_entropy_change_shape_and_offset,
+    gaussian_entropy_change_shape_invariant,
 )
 
 __all__ = [
@@ -63,4 +66,7 @@ __all__ = [
     "relative_entropy_spd",
     "log_det_ratio_from_eigvals",
     "gaussian_entropy_change_from_hessians",
+    "gaussian_entropy_change_basis_free",
+    "gaussian_entropy_change_shape_and_offset",
+    "gaussian_entropy_change_shape_invariant",
 ]
