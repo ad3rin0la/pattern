@@ -34,6 +34,19 @@ from tope.dynamics.free_energy import (
     DeltaGUnfoldStub,
     DeltaGDaggerStub,
 )
+from tope.dynamics.calibration import (
+    CalibrationResult,
+    HeldOutResult,
+    ProteinSpectrum,
+    StiffnessFn,
+    StiffnessProbe,
+    compute_spectrum,
+    fit_gamma_calibration,
+    held_out_drift,
+    make_uniform_stiffness_fn,
+    probe_stiffness_distribution,
+    uniform_stiffness,
+)
 from tope.dynamics.spd import (
     LogEuclideanContact,
     isotropic_contact_tensors,
@@ -75,4 +88,16 @@ __all__ = [
     "gaussian_entropy_change_shape_invariant",
     "basis_coupling_residual",
     "per_mode_entropy_change",
+    # γ calibration
+    "CalibrationResult",
+    "HeldOutResult",
+    "ProteinSpectrum",
+    "StiffnessFn",
+    "StiffnessProbe",
+    "compute_spectrum",
+    "fit_gamma_calibration",
+    "held_out_drift",
+    "make_uniform_stiffness_fn",
+    "probe_stiffness_distribution",
+    "uniform_stiffness",
 ]

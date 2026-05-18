@@ -30,6 +30,15 @@ from tope.data.mcsa_client import MCSAClient, MCSAEntry, CatalyticResidue
 from tope.data.pdb_client import PDBClient
 from tope.data.features import FeatureComputer, ActiveSiteFeatures
 from tope.data.dataset import DatasetBuilder, DatasetRecord
+from tope.data.bfactor import (
+    BFactorRecord,
+    BFactorDataset,
+    BFactorFilter,
+    extract_bfactors_from_structure,
+    ingest_directory,
+    stratified_split,
+    build_dataset,
+)
 from tope.data.topec_ingestion import (
     IngestionConfig,
     ToPERecord,
@@ -68,6 +77,14 @@ __all__ = [
     # Dataset
     "DatasetBuilder",
     "DatasetRecord",
+    # B-factor calibration data
+    "BFactorRecord",
+    "BFactorDataset",
+    "BFactorFilter",
+    "extract_bfactors_from_structure",
+    "ingest_directory",
+    "stratified_split",
+    "build_dataset",
     # TopEC ingestion
     "IngestionConfig",
     "ToPERecord",
