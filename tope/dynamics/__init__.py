@@ -33,6 +33,15 @@ from tope.dynamics.free_energy import (
     DeltaGUnfoldStub,
     DeltaGDaggerStub,
 )
+from tope.dynamics.spd import (
+    LogEuclideanContact,
+    isotropic_contact_tensors,
+    path_laplacian,
+    gaussian_chain_covariance,
+    relative_entropy_spd,
+    log_det_ratio_from_eigvals,
+    gaussian_entropy_change_from_hessians,
+)
 
 __all__ = [
     "NMAConfig",
@@ -46,4 +55,12 @@ __all__ = [
     "predict_delta_g_dagger",
     "DeltaGUnfoldStub",
     "DeltaGDaggerStub",
+    # SPD-manifold primitives
+    "LogEuclideanContact",
+    "isotropic_contact_tensors",
+    "path_laplacian",
+    "gaussian_chain_covariance",
+    "relative_entropy_spd",
+    "log_det_ratio_from_eigvals",
+    "gaussian_entropy_change_from_hessians",
 ]

@@ -14,14 +14,20 @@ Two callables are exported with the exact signatures expected by
 
 The default ``predict_delta_g_unfold`` composes existing primitives:
 
-    ΔG_unfold = ΔH_contacts − T · ΔS_config
+    ΔG_unfold = ΔH_contacts − T · ΔS_unfold
 
 where ``ΔH_contacts`` is the integrated SheafENM-equivalent contact
-energy (number of Cα contacts × γ × characteristic energy per contact)
-and ``ΔS_config`` is the harmonic configurational entropy
-``Σ_k (1/2) k_B (1 + ln(k_B T / ω_k²))`` summed over the NMA spectrum.
-This is the Schlitter-style upper bound, not the true entropy — it's a
-defensible scaffold value, not a load-bearing prediction.
+energy (Cα contact count × characteristic energy per contact) and
+``ΔS_unfold`` is the **intrinsic SPD log-det ratio**
+
+    ΔS_unfold = k_B · ½ log(det Σ_unfold / det Σ_fold)
+              = k_B · ½ log(Π λ(H_fold) / Π λ(H_unfold))
+
+between the folded harmonic covariance Σ_fold = H_fold⁺ and the
+unfolded Gaussian-chain covariance Σ_unfold (path-graph Laplacian
+pseudoinverse, segment variance σ²). Both live on the SPD manifold;
+the sign of ΔS_unfold is determined by Loewner order, not by a
+hand-set per-residue baseline.
 
 The default ``predict_delta_g_dagger`` is a flat constant returning the
 ``Ea_kcal_per_mol`` knob; users replace it with a trained head later.
@@ -40,6 +46,11 @@ import numpy as np
 
 from tope.data.active_site import ActiveSite
 from tope.dynamics.nma import NMAConfig, NormalModeAnalysis, KB_KCAL
+from tope.dynamics.spd import (
+    gaussian_chain_covariance,
+    gaussian_entropy_change_from_hessians,
+    path_laplacian,
+)
 
 
 @dataclass
@@ -50,16 +61,12 @@ class FreeEnergyConfig:
     # ~1–2 kcal/mol is the rough magnitude for a single nonbonded contact.
     contact_enthalpy_kcal: float = 1.5
 
-    # ΔS_config: Schlitter prefactor (1/2 in the harmonic formula). Kept
-    # as a knob so callers can ablate the entropy term.
-    schlitter_prefactor: float = 0.5
-
-    # Unfolded-state entropy baseline, kcal/(mol·K) per residue.
-    # Picked to put ΔS_unfold = S_unf − S_fold on the right side of zero
-    # for typical compact folds; ~3 cal/(mol·K) per residue is in the
-    # ballpark of residue conformational entropy in the random-coil
-    # limit. Treated as a constant baseline rather than a prediction.
-    s_unfolded_per_residue_kcal_per_K: float = 0.003
+    # Gaussian-chain segment variance (Å²) used to build Σ_unfold via the
+    # path-graph Laplacian. ~13 Å² is the textbook ideal-chain value.
+    # Replaces the previous hand-tuned per-residue entropy baseline:
+    # ΔS now comes from log(det Σ_unf / det Σ_fold), an intrinsic
+    # quantity on the SPD manifold.
+    segment_var_A2: float = 13.0
 
     # NMA parameters used internally.
     nma_cfg: NMAConfig = field(default_factory=NMAConfig)
@@ -96,15 +103,29 @@ def predict_delta_g_unfold(
     n_contacts = int(((d2 <= cfg.nma_cfg.contact_cutoff ** 2)).sum() // 2)
     dH = cfg.contact_enthalpy_kcal * n_contacts
 
-    # ── ΔS_config: Schlitter harmonic upper bound from NMA spectrum ─────
+    # ── ΔS_unfold via intrinsic log-det ratio on SPD(3N − 6) ────────────
+    # Folded Hessian: full ANM. Unfolded Hessian: path-graph Laplacian
+    # of an ideal Gaussian chain, rescaled to share units with the
+    # folded ANM (γ ↦ 1/σ² implies the unfolded scale is the inverse
+    # segment variance times the chain Laplacian). We compare *non-rigid*
+    # eigenvalues only: 6 zero modes are stripped from H_fold, 3
+    # translation modes from H_unfold, then spectra are sorted-and-paired
+    # by stiffness so the comparison is between corresponding modes.
     nma = NormalModeAnalysis(coords, cfg=cfg.nma_cfg)
-    omega, _ = nma.nontrivial_modes()
-    omega2 = np.maximum(omega ** 2, cfg.nma_cfg.eigenvalue_floor)
-    # S_harmonic ≈ k_B · α · Σ_k (1 + ln(k_B T / ω_k²)) ; truncate negatives.
-    log_term = np.log(np.maximum(KB_KCAL * T / omega2, 1e-30))
-    s_folded = KB_KCAL * cfg.schlitter_prefactor * (1.0 + log_term).sum()
-    s_unfolded = cfg.s_unfolded_per_residue_kcal_per_K * len(active_site.residues)
-    dS = s_unfolded - s_folded   # ΔS_unfold = S_unf − S_fold (should be > 0)
+    H_fold_eigs = np.linalg.eigvalsh(nma.H)
+    H_fold_nonzero = H_fold_eigs[H_fold_eigs > cfg.nma_cfg.eigenvalue_floor]
+
+    n_res = len(active_site.residues)
+    H_unfold_1d = (1.0 / cfg.segment_var_A2) * path_laplacian(n_res)
+    H_unfold_full = np.kron(H_unfold_1d, np.eye(3))
+    H_unfold_eigs = np.linalg.eigvalsh(H_unfold_full)
+    H_unfold_nonzero = H_unfold_eigs[H_unfold_eigs > cfg.nma_cfg.eigenvalue_floor]
+
+    # ½ log(det Σ_unf / det Σ_fold) = ½ log(Π λ_fold / Π λ_unfold).
+    log_ratio = gaussian_entropy_change_from_hessians(
+        H_fold_nonzero, H_unfold_nonzero, floor=cfg.nma_cfg.eigenvalue_floor,
+    )
+    dS = KB_KCAL * log_ratio  # kcal/(mol·K). Sign comes from Loewner order.
 
     return float(dH - T * dS)
 

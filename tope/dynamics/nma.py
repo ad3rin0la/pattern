@@ -23,7 +23,7 @@ needed — for relative B-factor profiles the units cancel.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 from scipy.constants import Boltzmann as _KB_SI
@@ -54,23 +54,26 @@ def build_anm_hessian(
     cutoff: float = 12.0,
     force_constant: float = 1.0,
     contacts: Optional[np.ndarray] = None,
+    contact_tensors: Optional["Callable[[int, int], np.ndarray]"] = None,
 ) -> np.ndarray:
     """Construct the 3N×3N anisotropic-network Hessian.
 
-    For each contact pair (i, j) within ``cutoff`` (or each pair listed
-    in ``contacts``), the off-diagonal block is
+    Two parametrisations are supported, chosen by ``contact_tensors``:
 
-        H_ij = −(γ / |r_ij|²) · (r_ij ⊗ r_ij)
+    * ``contact_tensors=None`` (default) — scalar-spring ANM. Each
+      contact contributes ``H_ij = −(γ / |r_ij|²) · (r_ij ⊗ r_ij)``,
+      which is rank-1 along the bond axis. **Degenerate for collinear
+      geometries**: a perfectly linear chain has zero transverse
+      stiffness and 2N near-zero modes.
 
-    and the diagonal block H_ii is the negative sum of its row's
-    off-diagonal blocks (so that rigid translations are zero modes).
+    * ``contact_tensors=fn`` — tensor-ANM. ``fn(i, j)`` returns an SPD
+      3×3 matrix ``Γ_ij`` (e.g. ``LogEuclideanContact.tensor``); the
+      block is used directly: ``H_ij = −Γ_ij``. Full rank by
+      construction, no collinear degeneracy.
 
-    Parameters
-    ----------
-    coords : (N, 3) ndarray
-    cutoff : Å, ignored if `contacts` is given
-    force_constant : uniform γ
-    contacts : (E, 2) ndarray of contact pairs, optional
+    The diagonal block ``H_ii`` is the negative sum of its row's
+    off-diagonal blocks in both modes (rigid translations remain
+    exact zero modes).
     """
     coords = np.asarray(coords, dtype=np.float64)
     n = coords.shape[0]
@@ -86,11 +89,19 @@ def build_anm_hessian(
         pairs = np.asarray(contacts, dtype=int)
 
     for i, j in pairs:
-        r_ij = coords[j] - coords[i]
-        dist2 = float(r_ij @ r_ij)
-        if dist2 < 1e-12:
-            continue
-        block = (force_constant / dist2) * np.outer(r_ij, r_ij)
+        if contact_tensors is not None:
+            block = np.asarray(contact_tensors(int(i), int(j)), dtype=np.float64)
+            if block.shape != (3, 3):
+                raise ValueError(
+                    f"contact_tensors({i},{j}) must return (3, 3), got {block.shape}"
+                )
+        else:
+            r_ij = coords[j] - coords[i]
+            dist2 = float(r_ij @ r_ij)
+            if dist2 < 1e-12:
+                continue
+            block = (force_constant / dist2) * np.outer(r_ij, r_ij)
+
         ii, jj = 3 * i, 3 * j
         H[ii:ii + 3, jj:jj + 3] -= block
         H[jj:jj + 3, ii:ii + 3] -= block
@@ -117,6 +128,7 @@ class NormalModeAnalysis:
         cfg: Optional[NMAConfig] = None,
         masses: Optional[np.ndarray] = None,
         contacts: Optional[np.ndarray] = None,
+        contact_tensors: Optional[Callable[[int, int], np.ndarray]] = None,
     ):
         self.cfg = cfg or NMAConfig()
         self.coords = np.asarray(coords, dtype=np.float64).copy()
@@ -134,6 +146,7 @@ class NormalModeAnalysis:
             cutoff=self.cfg.contact_cutoff,
             force_constant=self.cfg.force_constant,
             contacts=contacts,
+            contact_tensors=contact_tensors,
         )
 
         if self.cfg.mass_weighted:
