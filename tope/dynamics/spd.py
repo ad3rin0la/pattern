@@ -314,6 +314,11 @@ def gaussian_entropy_change_shape_invariant(
     interaction between the folded and unfolded eigenbases (through
     ``Pᵀ H_unfold P``), so the rescale-invariant signal is non-trivial.
     This is what should be trained against when γ is uncalibrated.
+
+    **Caveat:** the *sign* of this quantity depends on whether the
+    folded eigenbasis ``P`` projects preferentially onto stiff or
+    floppy unfolded modes (a Cauchy-interlacing fact). Use it as a
+    feature, not as a sign-conditioned ΔG_unfold input.
     """
     eigs_f = np.linalg.eigvalsh(0.5 * (H_fold + H_fold.T))
     nz_f = eigs_f[eigs_f > floor]
@@ -332,3 +337,57 @@ def gaussian_entropy_change_shape_invariant(
         n_trivial_fold=n_trivial_fold,
         floor=floor,
     )
+
+
+def basis_coupling_residual(
+    H_fold: np.ndarray,
+    H_unfold: np.ndarray,
+    n_trivial_fold: int = 6,
+    n_trivial_unfold: int = 3,
+    floor: float = 1e-12,
+) -> float:
+    """The part of ΔS_unfold that sorted-pairing cannot see.
+
+    Defined as the difference ``basis_free − sorted``. This is the
+    geometric-coupling signal between the folded and unfolded
+    eigenbases — non-zero whenever the folded modes don't align
+    eigenvalue-wise with the unfolded modes. Useful as an *auxiliary
+    feature* in mutation scoring without committing to a sign or
+    absolute scale.
+
+    Algebraically, both terms share the same unit offset
+    ``(k/2)·log(γ·σ²)``, so the residual is unit-independent —
+    immune to γ and σ² calibration uncertainty.
+    """
+    H_fold = 0.5 * (H_fold + H_fold.T)
+    H_unfold = 0.5 * (H_unfold + H_unfold.T)
+
+    eigs_f = np.linalg.eigvalsh(H_fold)
+    eigs_u = np.linalg.eigvalsh(H_unfold)
+    nz_f = eigs_f[eigs_f > floor]
+    nz_u = eigs_u[eigs_u > floor]
+    sorted_val = gaussian_entropy_change_from_hessians(nz_f, nz_u, floor=floor)
+    bf_val = gaussian_entropy_change_basis_free(
+        H_fold, H_unfold,
+        n_trivial_fold=n_trivial_fold,
+        n_trivial_unfold=n_trivial_unfold,
+        floor=floor,
+    )
+    return bf_val - sorted_val
+
+
+def per_mode_entropy_change(
+    log_ratio: float,
+    n_modes: int,
+) -> float:
+    """Normalise a log-det ratio to a per-mode quantity.
+
+    The total log-det ratio scales as ``k = 3N − 6`` for matched-
+    dimension Hessians, so cross-protein comparisons inherit an
+    ``O(N)`` bias from any uncalibrated unit offset. Dividing by ``k``
+    produces a size-invariant signal: ``ΔS / mode``, which has units
+    of nats per non-rigid degree of freedom.
+    """
+    if n_modes <= 0:
+        return 0.0
+    return float(log_ratio) / float(n_modes)

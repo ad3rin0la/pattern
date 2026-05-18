@@ -41,6 +41,7 @@ from tope.engineering.scoring import (
     ScoredMutationSet,
     AttributionScorer,
     ToPEModelScorer,
+    DynamicsScorer,
 )
 from tope.engineering.search import (
     SearchStrategy,
@@ -70,6 +71,7 @@ __all__ = [
     "ScoredMutationSet",
     "AttributionScorer",
     "ToPEModelScorer",
+    "DynamicsScorer",
     "SearchStrategy",
     "SaturationScan",
     "BeamSearch",

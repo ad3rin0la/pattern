@@ -30,6 +30,7 @@ from tope.dynamics.free_energy import (
     FreeEnergyConfig,
     predict_delta_g_unfold,
     predict_delta_g_dagger,
+    delta_delta_g_unfold,
     DeltaGUnfoldStub,
     DeltaGDaggerStub,
 )
@@ -44,6 +45,8 @@ from tope.dynamics.spd import (
     gaussian_entropy_change_basis_free,
     gaussian_entropy_change_shape_and_offset,
     gaussian_entropy_change_shape_invariant,
+    basis_coupling_residual,
+    per_mode_entropy_change,
 )
 
 __all__ = [
@@ -56,6 +59,7 @@ __all__ = [
     "FreeEnergyConfig",
     "predict_delta_g_unfold",
     "predict_delta_g_dagger",
+    "delta_delta_g_unfold",
     "DeltaGUnfoldStub",
     "DeltaGDaggerStub",
     # SPD-manifold primitives
@@ -69,4 +73,6 @@ __all__ = [
     "gaussian_entropy_change_basis_free",
     "gaussian_entropy_change_shape_and_offset",
     "gaussian_entropy_change_shape_invariant",
+    "basis_coupling_residual",
+    "per_mode_entropy_change",
 ]

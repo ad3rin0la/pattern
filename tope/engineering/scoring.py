@@ -132,6 +132,55 @@ class AttributionScorerConfig:
     objective_feature: str = "voip"  # column whose change drives the score
 
 
+class DynamicsScorer:
+    """ΔΔG_unfold scorer using the SPD-manifold dynamics pipeline.
+
+    Wraps :func:`tope.dynamics.delta_delta_g_unfold` so the cross-
+    protein N-bias from the unit offset cancels by construction
+    (matched-N point mutations). For indels, the offset persists and
+    the caller should be aware of the calibration caveat.
+
+    The scorer's sign convention matches the engine's
+    ``objective="maximize"`` default: a *destabilising* mutation
+    produces a *negative* ΔΔG (mutant unfolds more readily ⇒ less
+    stable ⇒ ΔG_unfold goes down ⇒ ΔΔG < 0). Flip via the engine's
+    objective knob to search for destabilisers instead.
+    """
+
+    def __init__(
+        self,
+        cfg=None,
+        T: float = 298.15,
+        repacker=None,
+    ):
+        from tope.dynamics.free_energy import FreeEnergyConfig
+        from tope.engineering.mutation import apply_mutations as _apply
+        self.cfg = cfg or FreeEnergyConfig()
+        self.T = float(T)
+        self.repacker = repacker
+        self._apply = _apply
+
+    def score(
+        self,
+        active_site,
+        mutations,
+    ):
+        from tope.dynamics.free_energy import delta_delta_g_unfold
+        mut_site, canonical = self._apply(active_site, mutations, self.repacker)
+        ddg = delta_delta_g_unfold(active_site, mut_site, self.T, self.cfg)
+        breakdown = {
+            "delta_delta_g_unfold_kcal": ddg,
+            "T_K": self.T,
+            "n_mutations": float(len(canonical)),
+            "entropy_mode": float(hash(self.cfg.entropy_mode) % 1_000_000),
+        }
+        return ScoredMutationSet(
+            MutationSet(tuple(canonical)),
+            score=ddg,
+            breakdown=breakdown,
+        )
+
+
 class AttributionScorer:
     """Model-free scorer using Ioffe descriptors weighted by proximity to
     the catalytic shell.

@@ -75,20 +75,20 @@ class FreeEnergyConfig:
     nma_cfg: NMAConfig = field(default_factory=NMAConfig)
 
     # How to compute the log-det ratio for ΔS_unfold:
-    #   "sorted"     — sorted-paired eigenvalue heuristic. Default.
-    #                  Σ²-sensitive (note #1) but has a guaranteed sign
-    #                  from Loewner order. ΔS_shape under sorted is
-    #                  *identically zero* (the whole signal is offset).
     #   "basis_free" — project both Hessians onto the folded non-rigid
-    #                  basis and take log det there. Captures basis
-    #                  coupling that sorted misses; still σ²-sensitive.
+    #                  basis and take log det there. Sign-guaranteed,
+    #                  captures the basis-coupling signal sorted-pairing
+    #                  misses, σ²-sensitive (cancels for ΔΔG within
+    #                  matched-N proteins). **Default.**
+    #   "sorted"     — sorted-paired eigenvalue heuristic. Sign-
+    #                  guaranteed via Loewner ordering, but the entire
+    #                  signal IS the σ² offset — ΔS_shape ≡ 0. Cheap.
     #   "shape_only" — geometric-mean-normalised basis-free log-det.
     #                  Invariant under uniform γ/σ² rescaling, but the
-    #                  *sign* of the result depends on subspace alignment
-    #                  (whether folded modes hit stiff or floppy unfolded
-    #                  modes). Do NOT use as ΔG_unfold input until the
-    #                  downstream head can handle indeterminate ΔS sign.
-    entropy_mode: str = "sorted"
+    #                  *sign* depends on subspace alignment. Useful as
+    #                  an auxiliary feature, NOT as a sign-conditioned
+    #                  ΔG_unfold input.
+    entropy_mode: str = "basis_free"
 
     # ΔG‡: stub-constant activation energy (kcal/mol) until a trained
     # head lands.
@@ -204,3 +204,36 @@ class DeltaGDaggerStub:
 
     def __call__(self, active_site: ActiveSite, T: float) -> float:
         return predict_delta_g_dagger(active_site, T, self.cfg)
+
+
+# ── ΔΔG: within-protein mutation delta ───────────────────────────────────────
+
+def delta_delta_g_unfold(
+    wildtype: ActiveSite,
+    mutant: ActiveSite,
+    T: float = 298.15,
+    cfg: Optional[FreeEnergyConfig] = None,
+) -> float:
+    """ΔΔG_unfold = ΔG_unfold(mutant) − ΔG_unfold(wildtype) at fixed T.
+
+    This is the engineering use case where the cross-protein N-bias
+    discussed in the calibration notes *cancels by construction*:
+
+    * For a point mutation, both proteins have the same ``N`` and the
+      ``(3N − 6)/2 · log(γσ²)`` unit offset is identical, so the
+      difference is unit-independent — γ-calibration uncertainty
+      affects ΔG but not ΔΔG.
+
+    * For an indel changing ``N`` by ``ΔN``, the offset persists at
+      magnitude ``(3·ΔN / 2) · log(γσ²)``. Treat ΔΔG from indels with
+      the same skepticism as absolute ΔG until γ is calibrated.
+
+    Within the EA fitness function this is the safer signal to score
+    mutations against. Use ``predict_delta_g_unfold`` for absolute
+    thermostability where the bias matters.
+    """
+    cfg = cfg or FreeEnergyConfig()
+    return float(
+        predict_delta_g_unfold(mutant, T, cfg)
+        - predict_delta_g_unfold(wildtype, T, cfg)
+    )
