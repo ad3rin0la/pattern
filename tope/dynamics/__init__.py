@@ -47,6 +47,15 @@ from tope.dynamics.calibration import (
     probe_stiffness_distribution,
     uniform_stiffness,
 )
+from tope.dynamics.bridges import (
+    BridgeReport,
+    compare_bridges,
+    diagonal_spd_bridge,
+    format_comparison_table,
+    select_best_bridge,
+    trace_bond_directed_bridge,
+    trace_isotropic_bridge,
+)
 from tope.dynamics.spd import (
     LogEuclideanContact,
     isotropic_contact_tensors,
@@ -100,4 +109,12 @@ __all__ = [
     "make_uniform_stiffness_fn",
     "probe_stiffness_distribution",
     "uniform_stiffness",
+    # SheafENM → ANM bridges
+    "BridgeReport",
+    "compare_bridges",
+    "diagonal_spd_bridge",
+    "format_comparison_table",
+    "select_best_bridge",
+    "trace_bond_directed_bridge",
+    "trace_isotropic_bridge",
 ]
