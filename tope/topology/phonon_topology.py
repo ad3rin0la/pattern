@@ -437,6 +437,8 @@ class SheafENM(HodgeLaplacianENM):
         sheaf_dim: int = 8,
         config: Optional[PhononTopologyConfig] = None,
         descriptor_metric: Optional[np.ndarray] = None,
+        use_hsh: bool = False,
+        hsh_config: Optional["Any"] = None,
     ):
         super().__init__(enzyme_pcc, config=config)
         self.sheaf_dim = sheaf_dim
@@ -448,6 +450,26 @@ class SheafENM(HodgeLaplacianENM):
         self.descriptor_metric: np.ndarray = (
             descriptor_metric if descriptor_metric is not None else np.eye(sheaf_dim)
         )
+
+        # Phase-2 HSH restriction maps (Avery 1994).  When enabled, the rank-1
+        # Cerrini outer product is replaced by an HSH expansion in the 36-element
+        # basis of Sym(R^d).  With the default ``init_mode="rank1"`` and an
+        # identity descriptor metric the map is byte-identical to the previous
+        # construction (zero-diff init).  Non-identity G induces a small
+        # normalisation difference — see hsh_restriction_maps.HSHSheafLaplacian.
+        self.use_hsh: bool = use_hsh
+        self._hsh: Optional[Any] = None
+        if use_hsh:
+            from tope.topology.hsh_restriction_maps import (
+                HSHConfig as _HSHConfig,
+                HSHSheafLaplacian as _HSHSheafLaplacian,
+            )
+            cfg = hsh_config if hsh_config is not None else _HSHConfig(d=sheaf_dim)
+            self._hsh = _HSHSheafLaplacian(
+                d=sheaf_dim,
+                descriptor_metric=self.descriptor_metric,
+                config=cfg,
+            )
 
     def sheaf_laplacian(
         self,
@@ -487,17 +509,22 @@ class SheafENM(HodgeLaplacianENM):
                 s_i = sheaf_sections[i]
                 s_j = sheaf_sections[j]
 
-                # Restriction map: metric-aware outer product (Cerrini 1971).
-                # G @ delta is the covariant form of the descriptor difference
-                # (index-lowering).  delta^T G delta is the metric-invariant
-                # norm squared; the outer product G_delta ⊗ G_delta gives the
-                # correct rank-1 restriction map that is invariant to separate
-                # scalings of each descriptor axis.
-                delta = s_i - s_j
-                G = self.descriptor_metric
-                G_delta = G @ delta
-                inner = float(delta @ G_delta) + 1e-10
-                R_ij = np.outer(G_delta, G_delta) / inner
+                if self.use_hsh and self._hsh is not None:
+                    # Phase-2 HSH expansion (Avery 1994): replaces the rank-1
+                    # outer product with a 36-element basis of Sym(R^d).
+                    R_ij = self._hsh.restriction_map(s_i, s_j)
+                else:
+                    # Restriction map: metric-aware outer product (Cerrini 1971).
+                    # G @ delta is the covariant form of the descriptor difference
+                    # (index-lowering).  delta^T G delta is the metric-invariant
+                    # norm squared; the outer product G_delta ⊗ G_delta gives the
+                    # correct rank-1 restriction map that is invariant to separate
+                    # scalings of each descriptor axis.
+                    delta = s_i - s_j
+                    G = self.descriptor_metric
+                    G_delta = G @ delta
+                    inner = float(delta @ G_delta) + 1e-10
+                    R_ij = np.outer(G_delta, G_delta) / inner
 
                 # Scale by graph Laplacian weight
                 L_sheaf[i*d:(i+1)*d, j*d:(j+1)*d] = w * (np.eye(d) - R_ij)
@@ -542,10 +569,15 @@ class SheafENM(HodgeLaplacianENM):
         for idx in range(len(rows)):
             i, j = int(rows[idx]), int(cols[idx])
             if i != j and i in sheaf_sections and j in sheaf_sections:
-                delta = sheaf_sections[i] - sheaf_sections[j]
-                G_delta = G @ delta
-                inner = float(delta @ G_delta) + 1e-10
-                R[(i, j)] = np.outer(G_delta, G_delta) / inner
+                if self.use_hsh and self._hsh is not None:
+                    R[(i, j)] = self._hsh.restriction_map(
+                        sheaf_sections[i], sheaf_sections[j]
+                    )
+                else:
+                    delta = sheaf_sections[i] - sheaf_sections[j]
+                    G_delta = G @ delta
+                    inner = float(delta @ G_delta) + 1e-10
+                    R[(i, j)] = np.outer(G_delta, G_delta) / inner
         return R
 
     def sheaf_endomorphism(

@@ -45,6 +45,16 @@ from tope.topology.g_structure import (
     AlmostTangentDetector,
     nijenhuis_signal,
 )
+from tope.topology.hsh_restriction_maps import (
+    HSHConfig,
+    HSHSheafLaplacian,
+    HSHRestrictionMap,
+    compute_hsh_basis_matrices,
+    hsh_coefficients,
+    zonal_hsh_kernel,
+    verify_addition_theorem,
+    run_validation as run_hsh_validation,
+)
 
 __all__ = [
     # TTN persistent homology
@@ -80,4 +90,13 @@ __all__ = [
     "almost_tangent_score",
     "AlmostTangentDetector",
     "nijenhuis_signal",
+    # HSH restriction maps (Phase 2 sheaf upgrade)
+    "HSHConfig",
+    "HSHSheafLaplacian",
+    "HSHRestrictionMap",
+    "compute_hsh_basis_matrices",
+    "hsh_coefficients",
+    "zonal_hsh_kernel",
+    "verify_addition_theorem",
+    "run_hsh_validation",
 ]
