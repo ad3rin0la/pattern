@@ -63,11 +63,17 @@ class DatasetRecord:
     features_path: str = ""
     mask_path: str = ""
     adjacency_dir: str = ""
+    atom_residue_path: str = ""   # rank-0 → rank-2 incidence (drives B_12)
 
     # Kinetics labels (log10 values; None if unavailable)
     log_kcat: Optional[float] = None       # log10(kcat / s⁻¹)
     log_km: Optional[float] = None         # log10(Km / mM)
     log_kcat_km: Optional[float] = None    # log10(kcat/Km)
+
+    # Reaction molecules (SMILES; empty if unavailable). Featurised on load into
+    # the substrate/product graphs the cross-attention + kinetics head consume.
+    substrate_smiles: str = ""
+    product_smiles: str = ""
 
     # Train / val / test split
     split: str = ""
@@ -102,6 +108,7 @@ class DatasetBuilder:
         split_ratios: Tuple[float, float, float] = (0.8, 0.1, 0.1),
         seed: int = 42,
         kinetics_map: Optional[Dict[str, Dict[str, float]]] = None,
+        molecule_map: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> List[DatasetRecord]:
         """Build the full dataset from active sites and their features.
 
@@ -140,6 +147,7 @@ class DatasetBuilder:
         split_labels[indices[n_train + n_val:]] = "test"
 
         records: List[DatasetRecord] = []
+        molecule_map = molecule_map or {}
 
         for i, (site, feats) in enumerate(zip(active_sites, features_list)):
             # Save per-sample arrays
@@ -149,10 +157,15 @@ class DatasetBuilder:
             coords_path = sample_dir / "coords.npy"
             features_path = sample_dir / "features.npy"
             mask_path = sample_dir / "catalytic_mask.npy"
+            atom_residue_path = sample_dir / "atom_residue.npy"
 
             np.save(str(coords_path), feats.coords)
             np.save(str(features_path), feats.feature_matrix)
             np.save(str(mask_path), feats.catalytic_mask)
+            # Persist the atom→residue incidence (rank-0 → rank-2 membership)
+            # so the curated complex — not the model — defines B_12 downstream.
+            # Aligned 1:1 with the saved atom coords / features ordering.
+            np.save(str(atom_residue_path), site.atom_residue_incidence())
 
             # Save filtration adjacency matrices
             adj_dir = sample_dir / "adjacency"
@@ -170,6 +183,9 @@ class DatasetBuilder:
             log_km = kin.get("Km")
             log_kcat_km = kin.get("kcat/Km")
 
+            # Look up reaction-molecule SMILES (substrate / product).
+            mol = molecule_map.get(site.pdb_id, {})
+
             record = DatasetRecord(
                 pdb_id=site.pdb_id,
                 ec_number=site.ec_number,
@@ -183,9 +199,12 @@ class DatasetBuilder:
                 features_path=str(features_path.relative_to(self.features_dir)),
                 mask_path=str(mask_path.relative_to(self.features_dir)),
                 adjacency_dir=str(adj_dir.relative_to(self.features_dir)),
+                atom_residue_path=str(atom_residue_path.relative_to(self.features_dir)),
                 log_kcat=log_kcat,
                 log_km=log_km,
                 log_kcat_km=log_kcat_km,
+                substrate_smiles=str(mol.get("substrate", "")),
+                product_smiles=str(mol.get("product", "")),
                 split=str(split_labels[i]),
             )
             records.append(record)
@@ -401,8 +420,11 @@ class DatasetBuilder:
             "features_path": r.features_path,
             "mask_path": r.mask_path,
             "adjacency_dir": r.adjacency_dir,
+            "atom_residue_path": r.atom_residue_path,
             "log_kcat": r.log_kcat,
             "log_km": r.log_km,
             "log_kcat_km": r.log_kcat_km,
+            "substrate_smiles": r.substrate_smiles,
+            "product_smiles": r.product_smiles,
             "split": r.split,
         }

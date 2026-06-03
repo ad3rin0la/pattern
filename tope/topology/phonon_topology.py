@@ -580,6 +580,163 @@ class SheafENM(HodgeLaplacianENM):
                     R[(i, j)] = np.outer(G_delta, G_delta) / inner
         return R
 
+    # ──────────────────────────────────────────────────────────────────────
+    # Phase-2 §5: gyro-transport restriction maps + tangent-space sheaf
+    # Laplacian (consolidated spec §5).  These are additive — the existing
+    # ``sheaf_laplacian`` / spectral pipeline above is untouched.
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _hyperbolic_features(
+        self,
+        sheaf_sections: Dict[int, np.ndarray],
+        hyperbolic_features: Optional[Dict[int, np.ndarray]],
+        ball_radius: float,
+    ) -> Dict[int, np.ndarray]:
+        """Return the ball feature field ``{h_x}`` (spec §5.1).
+
+        If an explicit field is given it is used as-is; otherwise each
+        descriptor section is treated as a tangent vector at the origin and
+        lifted into the ball via ``h_x = exp_o(s_x)`` — the same field read
+        non-linearly by the §2–3 gyro-CCANN head, read here through ``log_o``.
+        """
+        from tope.topology.gyro_memory import exp_map_origin
+
+        if hyperbolic_features is not None:
+            return hyperbolic_features
+        return {
+            k: exp_map_origin(np.asarray(v, dtype=float), s=ball_radius)
+            for k, v in sheaf_sections.items()
+        }
+
+    def gyro_restriction_maps(
+        self,
+        rank: int,
+        sheaf_sections: Dict[int, np.ndarray],
+        hyperbolic_features: Optional[Dict[int, np.ndarray]] = None,
+        ball_radius: float = 1.0,
+    ) -> Dict[tuple, np.ndarray]:
+        r"""Transport-corrected restriction maps ``F_{x◁y} = K_xy · R_xy`` (§5.2).
+
+        ``K_xy`` is the VOIP-informed stiffness block (the metric-aware /
+        HSH map from :meth:`build_restriction_maps`); ``R_xy = gyr[h_y, ⊖h_x]``
+        is the gyro-transport rotation (spec §4).  **Dropping ``R_xy`` is the
+        silent metric-flattening** the spec flags at this site — the
+        Euclidean ``K``-only map is the special case ``h ≡ 0``.
+
+        Returns
+        -------
+        F : dict[(i, j) → (d, d)]  full restriction maps with transport.
+        """
+        from tope.topology.gyro_memory import transport_rotation
+
+        K = self.build_restriction_maps(rank, sheaf_sections)
+        h = self._hyperbolic_features(sheaf_sections, hyperbolic_features, ball_radius)
+        F: Dict[tuple, np.ndarray] = {}
+        for (i, j), K_ij in K.items():
+            if i in h and j in h:
+                R_ij = transport_rotation(h[i], h[j], s=ball_radius)  # gyr[h_j,⊖h_i]
+                F[(i, j)] = K_ij @ R_ij
+            else:
+                F[(i, j)] = K_ij
+        return F
+
+    def gyro_sheaf_laplacian(
+        self,
+        rank: int,
+        sheaf_sections: Dict[int, np.ndarray],
+        hyperbolic_features: Optional[Dict[int, np.ndarray]] = None,
+        ball_radius: float = 1.0,
+    ) -> np.ndarray:
+        r"""γ-weighted tangent-space sheaf Laplacian ``L = δ* δ`` (spec §5.3–5.4).
+
+        Built in the adjoint-consistent form ``L = D_0^{-1} δ^T D_1 δ`` so it is
+        **self-adjoint** w.r.t. the γ-measure inner product ``⟨·,·⟩ = ·^T D_0 ·``
+        and has a **real, ≥ 0 spectrum** (PSD), unconditionally at degree 0 —
+        no ``∂² = 0`` is required (spec §5.4).  Curvature is front-loaded into
+        the chart (``log_o``) and the restriction-map transport ``R_xy``.
+
+        * coboundary  δ : for each undirected edge ``e = (i, j)`` (oriented
+          ``i → j``), the block row is ``+I`` at ``i`` and ``−R_ij`` at ``j``,
+          where ``R_ij = gyr[h_j, ⊖h_i]`` carries the curvature;
+        * stalk measure  ``D_0 = diag(μ(h_i) I_d)``, ``μ(h) = γ_h^{2d}`` (§5.3);
+        * coface measure ``D_1 = diag(w_ij I_d)`` from the Hodge edge weight.
+
+        ``ker L`` is the degree-0 sheaf cohomology ``H^0(X; F)``; the low-lying
+        spectral gap is the Phase-5H cooperativity descriptor.
+
+        Returns
+        -------
+        L : (N·d, N·d) self-adjoint PSD sheaf Laplacian.
+        """
+        from tope.topology.gyro_memory import transport_rotation, conformal_gamma
+
+        L_k = self.hodge_laplacian(rank)
+        L_k_dense = L_k.toarray() if hasattr(L_k, "toarray") else np.asarray(L_k)
+        N = L_k_dense.shape[0]
+        d = self.sheaf_dim
+
+        h = self._hyperbolic_features(sheaf_sections, hyperbolic_features, ball_radius)
+        # γ-measure per cell; cells without a section get μ = 1 (Euclidean).
+        mu = np.ones(N)
+        for i in range(N):
+            if i in h:
+                gamma = float(conformal_gamma(h[i], s=ball_radius))
+                mu[i] = gamma ** (2 * d)
+
+        # Undirected edges with positive coupling weight w_ij = |L_k[i,j]|.
+        edges: List[Tuple[int, int, float]] = []
+        for i in range(N):
+            for j in range(i + 1, N):
+                w = abs(float(L_k_dense[i, j]))
+                if w > 0.0 and i in h and j in h:
+                    edges.append((i, j, w))
+
+        E = len(edges)
+        if E == 0:
+            return np.zeros((N * d, N * d))
+
+        # Coboundary δ ∈ R^{E·d × N·d}.
+        delta = np.zeros((E * d, N * d))
+        D1 = np.zeros(E * d)
+        for e, (i, j, w) in enumerate(edges):
+            R_ij = transport_rotation(h[i], h[j], s=ball_radius)  # gyr[h_j, ⊖h_i]
+            rb = slice(e * d, (e + 1) * d)
+            delta[rb, i * d:(i + 1) * d] = np.eye(d)
+            delta[rb, j * d:(j + 1) * d] = -R_ij
+            D1[rb] = w
+
+        # L = D_0^{-1} δ^T D_1 δ  (self-adjoint w.r.t. D_0, PSD).
+        D0_inv = np.repeat(1.0 / np.clip(mu, 1e-12, None), d)
+        L = (D0_inv[:, None] * delta.T) @ (D1[:, None] * delta)
+        return L
+
+    def holonomy_frust_index(
+        self,
+        loops: List[List[int]],
+        sheaf_sections: Dict[int, np.ndarray],
+        hyperbolic_features: Optional[Dict[int, np.ndarray]] = None,
+        ball_radius: float = 1.0,
+    ) -> Dict[str, object]:
+        r"""Gyration (holonomy) FrustIndex over cell loops (spec §5.5).
+
+        The Hodge tower needs a *flat* sheaf (``δ_r δ_{r-1} = 0``); failure of
+        flatness is the holonomy ``Hol(loop) = ∏ R_xy ≠ I`` — the sheaf
+        curvature, which the spec identifies as the FrustIndex carrying
+        allostery.  This is the gyro-transport reading; the Nijenhuis/Chern
+        reading is :func:`tope.topology.g_structure.frust_index_cb`.
+
+        Returns the dict from
+        :func:`tope.topology.gyro_memory.frust_index_gyro`.
+        """
+        from tope.topology.gyro_memory import frust_index_gyro
+
+        h = self._hyperbolic_features(sheaf_sections, hyperbolic_features, ball_radius)
+        keys = sorted(h.keys())
+        index_of = {k: idx for idx, k in enumerate(keys)}
+        feats = np.stack([h[k] for k in keys])
+        remapped = [[index_of[c] for c in loop] for loop in loops]
+        return frust_index_gyro(feats, remapped, s=ball_radius)
+
     def sheaf_endomorphism(
         self,
         sheaf_sections: Dict[int, np.ndarray],

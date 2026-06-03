@@ -22,6 +22,13 @@ JacobianCorrectedBlock   : adjoint-correct bidirectional attention — adds the
                            Ferreira (2015) Jacobian factor j_a(x) to the reverse
                            logit so forward and reverse attention are exactly
                            adjoint under the (σ,t)-invariant measure dμ_{σ,t}.
+GyroCCAttentionBlock     : gyro-adjoint bidirectional attention on the Poincaré
+                           ball — the anisotropic upgrade path of
+                           JacobianCorrectedBlock.  Scores edges with the
+                           gyrometric logit on the curved relative coordinate
+                           v_{i←j}=log_o((⊖p_i)⊕q_j) and applies the mandatory
+                           gyration frame correction G_ij on the reverse
+                           direction (consolidated spec §3).
 HodgeletFilteredCCBlock  : composes all three extensions in one module.
 CCAttentionPushForwardImproved: equal-rank variant with separate Q/K/V
                            projections and scaled logits.
@@ -69,6 +76,22 @@ try:
     HAS_G_STRUCTURE = True
 except ImportError:
     HAS_G_STRUCTURE = False
+
+# Shared Möbius gyration primitives (consolidated spec §4).  Imported lazily so
+# cc_attention remains importable without the topology package; the gyrometric
+# attention block (§3 upgrade path) requires them.
+try:
+    from tope.topology.gyro_memory import (
+        gyr_torch as _gyr_torch,
+        log_o as _log_o,
+        exp_o as _exp_o,
+        mobius_add as _mobius_add,
+        gyrobary as _gyrobary,
+        gyrodistance as _gyrodistance,
+    )
+    HAS_GYRO = True
+except ImportError:
+    HAS_GYRO = False
 
 
 def nijenhuis_signal(voip: "Tensor", edge_index: "Tensor") -> "Tensor":
@@ -831,6 +854,201 @@ class JacobianCorrectedBlock(nn.Module):
         return (f"d_s_in={self.d_s_in}, d_t_in={self.d_t_in}, d_out={self.d_out}, "
                 f"n_heads={self.n_heads}, scale={self.scale:.4f}, "
                 f"ball_radius={self.ball_radius:.3f}, sigma={self.sigma:.3f}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Structural extension 4: GyroCCAttentionBlock  (consolidated spec §3)
+# Anisotropic gyrometric logit with the mandatory gyration frame correction.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class GyroCCAttentionBlock(nn.Module):
+    r"""Gyro-adjoint bidirectional CC-attention on the Poincaré ball (spec §3).
+
+    This is the *anisotropic upgrade path* of :class:`JacobianCorrectedBlock`.
+    Where that block scores edges with a Euclidean concat logit
+    ``aᵀ[Wh_i ‖ Wh_j]`` and corrects only the Ferreira measure Jacobian, this
+    block scores with the **gyrometric** logit on the curved relative
+    coordinate and additionally applies the **gyration frame correction**
+    ``G_ij = gyr[q_j, ⊖p_i]`` on the reverse direction (the verified-correct
+    argument order; see the implementation note on the deviation from the
+    spec's §3.1 ``gyr[p_i, ⊖q_j]``).
+
+    Per the spec design rule:
+
+    * for an *isotropic* gyrodistance logit, ``G_ij`` acts inside a norm and
+      drops out — the Jacobian alone is exact (that is ``JacobianCorrectedBlock``);
+    * for the *anisotropic* ``aᵀv`` logit used here, ``G_ij`` is **mandatory**;
+      omitting it silently breaks adjointness.  Both corrections are applied so
+      the Def-33 block is gyro-adjoint end to end:
+      ``att^{t→s}_{ji} ∝ (μ(p_i)/μ(q_j)) att^{s→t}_{ij}``.
+
+    Forward (s→t) logit / coordinate (spec §3)::
+
+        p_i = exp_o(W_t H^t_i),   q_j = exp_o(W_s H^s_j)      (ball points)
+        v_{i←j} = log_o((⊖p_i) ⊕ q_j)                          (tangent coord)
+        e_ij = φ(aᵀ v_{i←j} / √d)
+
+    Reverse (t→s) logit (two corrections)::
+
+        f_ji = φ(aᵀ(−G_ij v_{i←j}) / √d) + 2d(log γ_{p_i} − log γ_{q_j})
+
+    The aggregation is the Einstein gyrobarycenter (spec §2) so outputs stay in
+    the ball.
+
+    Parameters
+    ----------
+    d_s_in, d_t_in : input dims for rank-s and rank-t
+    d_out          : output dim (must be divisible by n_heads)
+    n_heads        : attention heads (each head is its own head_dim-ball)
+    negative_slope : LeakyReLU slope for φ
+    ball_radius    : s > 0, Poincaré ball radius
+    learn_geometry : learn ball_radius (True) or fix it (False)
+    isotropic      : if True use the gyrodistance logit (G_ij drops out, kept for
+                     ablation); default False → anisotropic aᵀv with mandatory G_ij.
+    """
+
+    def __init__(
+        self,
+        d_s_in: int,
+        d_t_in: int,
+        d_out: int,
+        n_heads: int = 1,
+        negative_slope: float = 0.2,
+        ball_radius: float = 1.0,
+        learn_geometry: bool = True,
+        isotropic: bool = False,
+    ) -> None:
+        super().__init__()
+        if not HAS_GYRO:
+            raise ImportError(
+                "GyroCCAttentionBlock requires tope.topology.gyro_memory "
+                "(Möbius gyration primitives, spec §4)."
+            )
+        assert d_out % n_heads == 0, "d_out must be divisible by n_heads"
+        self.d_s_in = d_s_in
+        self.d_t_in = d_t_in
+        self.d_out = d_out
+        self.n_heads = n_heads
+        self.head_dim = d_out // n_heads
+        self.isotropic = isotropic
+        self.inv_sqrt_d = self.head_dim ** -0.5
+
+        self.W_s = nn.Linear(d_s_in, d_out, bias=False)
+        self.W_t = nn.Linear(d_t_in, d_out, bias=False)
+        # Anisotropy direction a ∈ T_o B^{head_dim}, one per head.
+        self.a = nn.Parameter(torch.empty(n_heads, self.head_dim))
+        nn.init.xavier_uniform_(self.a.unsqueeze(0))
+
+        self.phi = nn.LeakyReLU(negative_slope)
+
+        if learn_geometry:
+            self.log_s = nn.Parameter(torch.tensor(math.log(ball_radius)))
+        else:
+            self.register_buffer("log_s", torch.tensor(math.log(ball_radius)))
+
+    @property
+    def ball_radius(self) -> float:
+        return self.log_s.exp().item()
+
+    def _to_ball(self, lin_out: Tensor, s: float) -> Tensor:
+        """Lift a Euclidean projection into the ball: exp_o(·)  (= W ⊗_M lift)."""
+        return _exp_o(lin_out, s=s)
+
+    def forward(
+        self,
+        H_s: Tensor,
+        H_t: Tensor,
+        B: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Parameters
+        ----------
+        H_s : (N_s, d_s_in)   rank-s features
+        H_t : (N_t, d_t_in)   rank-t features
+        B   : (2, E)          incidence index [src (s-cell), tgt (t-cell)]
+
+        Returns
+        -------
+        K_t : (N_t, d_out)  forward  s→t  gyrobarycentric aggregation of q_j
+        K_s : (N_s, d_out)  reverse  t→s  gyro-adjoint (frame + measure corrected)
+        """
+        N_s, N_t = H_s.size(0), H_t.size(0)
+        src, tgt = B[0], B[1]
+        E = src.size(0)
+        Hh, hd = self.n_heads, self.head_dim
+        s = self.log_s.exp()
+        s_val = float(s.item())
+
+        # Ball points per head: p (rank-t), q (rank-s).
+        q = self._to_ball(self.W_s(H_s), s).view(N_s, Hh, hd)   # (N_s, H, hd)
+        p = self._to_ball(self.W_t(H_t), s).view(N_t, Hh, hd)   # (N_t, H, hd)
+
+        p_i = p[tgt]   # (E, H, hd)
+        q_j = q[src]   # (E, H, hd)
+
+        # Curved relative coordinate v_{i←j} = log_o((⊖p_i) ⊕ q_j).
+        v = _log_o(_mobius_add(-p_i, q_j, s=s_val), s=s_val)    # (E, H, hd)
+
+        # ── Forward s→t logit ────────────────────────────────────────────────
+        if self.isotropic:
+            # e_ij = −d_G(p_i, q_j)² / (8τ); with τ folded into a scale of 1.
+            e_fwd = -(_gyrodistance(p_i, q_j, s=s_val) ** 2) * (self.inv_sqrt_d / 8.0)
+        else:
+            e_fwd = self.phi((self.a.unsqueeze(0) * v).sum(-1) * self.inv_sqrt_d)
+        att_fwd = _scatter_softmax_2d(e_fwd, tgt, N_t)          # (E, H)
+
+        # Gyrobarycentric aggregation of q_j with attention weights (spec §2).
+        K_t = self._gyrobary_scatter(att_fwd, q_j, tgt, N_t, s_val)
+
+        # ── Reverse t→s logit (frame + measure corrections, spec §3) ─────────
+        # γ for the additive log-Jacobian; exponent 2·hd per the ball fiber dim.
+        log_gamma_p = -0.5 * (1.0 - (p_i * p_i).sum(-1) / (s * s)).clamp(min=1e-9).log()
+        log_gamma_q = -0.5 * (1.0 - (q_j * q_j).sum(-1) / (s * s)).clamp(min=1e-9).log()
+        jac = 2.0 * hd * (log_gamma_p - log_gamma_q)            # (E, H)
+
+        if self.isotropic:
+            # G_ij drops out inside the norm; gyrodistance is symmetric.
+            f_rev = -(_gyrodistance(p_i, q_j, s=s_val) ** 2) * (self.inv_sqrt_d / 8.0)
+        else:
+            # Mandatory gyration frame correction.  The reverse tangent
+            # coordinate is v_{j←i} = −G_ij v_{i←j}; the gyrogroup identity
+            #   log_o((⊖q)⊕p) = −gyr[q, ⊖p] · log_o((⊖p)⊕q)
+            # fixes G_ij = gyr[q_j, ⊖p_i] (verified to 2.5e-15, d=2..8).
+            #
+            # NOTE (deviation from spec §3.1): the spec writes
+            # "G_ij = gyr[p_i, ⊖q_j]", but that argument order does NOT satisfy
+            # the reverse-coordinate identity (numerically ~random, err ~3.2);
+            # it also disagrees with the spec's own §4 transport convention
+            # R_xy = gyr[h_y, ⊖h_x] (here the transported point p_i plays the
+            # role of h_x, so a = q_j, b = ⊖p_i).  We use the verified order.
+            Gv = _gyr_torch(q_j, -p_i, v, s=s_val)              # (E, H, hd)
+            f_rev = self.phi((self.a.unsqueeze(0) * (-Gv)).sum(-1) * self.inv_sqrt_d)
+        f_rev = f_rev + jac
+        att_rev = _scatter_softmax_2d(f_rev, src, N_s)          # (E, H)
+
+        K_s = self._gyrobary_scatter(att_rev, p_i, src, N_s, s_val)
+        return K_t, K_s
+
+    @staticmethod
+    def _gyrobary_scatter(
+        att: Tensor, pts: Tensor, index: Tensor, dim_size: int, s: float
+    ) -> Tensor:
+        """Scattered Einstein gyrobarycenter (spec §2) over a neighborhood.
+
+        gyrobary(w; v) = Σ_j w_j γ_{v_j} v_j / Σ_j w_j γ_{v_j}, per (group, head).
+        ``att`` : (E, H);  ``pts`` : (E, H, hd).
+        """
+        Hh, hd = pts.size(1), pts.size(2)
+        gamma = (1.0 - (pts * pts).sum(-1) / (s * s)).clamp(min=1e-9).rsqrt()  # (E,H)
+        w = (att * gamma).unsqueeze(-1)                        # (E, H, 1)
+        num = _scatter_add_nd(w * pts, index, dim_size)        # (G, H, hd)
+        den = _scatter_add_nd(w, index, dim_size).clamp(min=1e-12)  # (G, H, 1)
+        return (num / den).reshape(dim_size, Hh * hd)
+
+    def extra_repr(self) -> str:
+        return (f"d_s_in={self.d_s_in}, d_t_in={self.d_t_in}, d_out={self.d_out}, "
+                f"n_heads={self.n_heads}, ball_radius={self.ball_radius:.3f}, "
+                f"isotropic={self.isotropic}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -260,3 +260,24 @@ class PipelineConfig:
     # Output
     output_format: str = "parquet"       # parquet | csv | hdf5
     data_root: Path = DATA_ROOT
+
+
+@dataclass
+class CurationConfig(PipelineConfig):
+    """Curation-run configuration (CLI/entry-point facing).
+
+    Extends :class:`PipelineConfig` with an ``output_dir`` knob, which is the
+    field the ``tope-curate`` CLI and the package docstring examples construct
+    with (``CurationConfig(output_dir=...)``).  ``CurationPipeline`` itself
+    reads ``data_root`` for all its output paths, so ``output_dir`` is bridged
+    onto ``data_root`` in ``__post_init__`` — passing ``output_dir`` redirects
+    every pipeline output, exactly as the CLI intends, while remaining a
+    drop-in ``PipelineConfig`` for the pipeline's interface.
+    """
+
+    output_dir: str = ""
+
+    def __post_init__(self) -> None:
+        # Honour an explicit output_dir by pointing data_root at it.
+        if self.output_dir:
+            self.data_root = Path(self.output_dir)

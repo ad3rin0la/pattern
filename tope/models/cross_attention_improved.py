@@ -26,8 +26,18 @@ adapted to the bipartite enzyme–molecule geometry:
                               forward and reverse passes are exactly adjoint under
                               dμ_{σ,t}.
 
-Additionally, ImprovedSubstrateProductCrossAttention composes all three as a
-drop-in replacement for SubstrateProductCrossAttention.
+  4. GyroCrossAttention     — Anisotropic §3 cross-rank upgrade.  The dense
+                              bipartite analog of cc_attention.GyroCCAttentionBlock
+                              and the anisotropic upgrade path of
+                              JacobianCrossAttention: it scores with the
+                              gyrometric logit φ(aᵀ v_{j←i}/√d) on the curved
+                              relative coordinate and applies the mandatory
+                              gyration frame correction on the reverse pass
+                              (the isotropic JacobianCrossAttention is the case
+                              where that correction provably drops out).
+
+Additionally, ImprovedSubstrateProductCrossAttention composes the first three as
+a drop-in replacement for SubstrateProductCrossAttention.
 
 Bug fixes vs. the initial design draft
 ---------------------------------------
@@ -60,6 +70,20 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from tope.models.cc_attention import HodgeletFilter, _mobius_jacobian
+
+# Shared Möbius gyration primitives (consolidated spec §4); the anisotropic
+# GyroCrossAttention (§3 cross-rank upgrade) needs them.  Lazy/guarded so this
+# module stays importable without the topology package.
+try:
+    from tope.topology.gyro_memory import (
+        gyr_torch as _gyr_torch,
+        log_o as _log_o,
+        exp_o as _exp_o,
+        mobius_add as _mobius_add,
+    )
+    HAS_GYRO = True
+except ImportError:
+    HAS_GYRO = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -413,6 +437,135 @@ class JacobianCrossAttention(nn.Module):
                 f"n_heads={self.n_heads}, head_dim={self.head_dim}, "
                 f"ball_radius={self.log_t.exp().item():.3f}, "
                 f"sigma={self.sigma_param.item():.3f}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. GyroCrossAttention — anisotropic §3 cross-rank upgrade
+#    Dense bipartite analog of GyroCCAttentionBlock (cc_attention.py).
+# ══════════════════════════════════════════════════════════════════════════════
+
+class GyroCrossAttention(nn.Module):
+    r"""Anisotropic gyrometric bipartite cross-attention (consolidated spec §3).
+
+    The dense (all-pairs enzyme↔molecule) counterpart of
+    :class:`tope.models.cc_attention.GyroCCAttentionBlock`, and the
+    *anisotropic upgrade path* of :class:`JacobianCrossAttention`.
+
+    :class:`JacobianCrossAttention` already realises the spec's **isotropic**
+    case: its logit is ``−d²_B(Q_i, K_j)/τ``, a gyrodistance inside a norm, so
+    the gyration frame correction ``G_ij`` provably drops out and the Ferreira
+    Jacobian alone is exact.  This block instead uses the **anisotropic**
+    logit ``φ(aᵀ v_{i←j}/√d)`` on the curved relative coordinate, for which
+    ``G_ij`` is **mandatory** (omitting it silently breaks adjointness):
+
+        p_j = exp_o(Q h_enz_j),  q_i = exp_o(K h_mol_i)         (ball points)
+        v_{j←i} = log_o((⊖p_j) ⊕ q_i)                            (tangent coord)
+        e_ji = φ(aᵀ v_{j←i} / √d)                                (enzyme→mol)
+        f_ij = φ(aᵀ(−G_ji v_{j←i}) / √d) + 2d(log γ_{p_j} − log γ_{q_i})
+
+    with ``G_ji = gyr[q_i, ⊖p_j]`` (the verified-correct argument order; see
+    GyroCCAttentionBlock's note on the spec's §3.1 slip).
+
+    Returns the same ``(h_enz_attended, attn_fwd, h_mol_attended)`` triple as
+    :class:`JacobianCrossAttention` so it is a drop-in replacement.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        mol_dim: Optional[int] = None,
+        n_heads: int = 8,
+        dropout: float = 0.1,
+        ball_radius: float = 1.0,
+        learn_geometry: bool = True,
+    ) -> None:
+        super().__init__()
+        if not HAS_GYRO:
+            raise ImportError(
+                "GyroCrossAttention requires tope.topology.gyro_memory "
+                "(Möbius gyration primitives, spec §4)."
+            )
+        mol_dim = mol_dim or hidden_dim
+        assert hidden_dim % n_heads == 0
+        self.hidden_dim = hidden_dim
+        self.mol_dim = mol_dim
+        self.n_heads = n_heads
+        self.head_dim = hidden_dim // n_heads
+        self.inv_sqrt_d = self.head_dim ** -0.5
+
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.k_proj = nn.Linear(mol_dim, hidden_dim, bias=False)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.a = nn.Parameter(torch.empty(n_heads, self.head_dim))
+        nn.init.xavier_uniform_(self.a.unsqueeze(0))
+
+        self.phi = nn.LeakyReLU(0.2)
+        self.dropout = nn.Dropout(dropout)
+        self.ln = nn.LayerNorm(hidden_dim)
+
+        if learn_geometry:
+            self.log_s = nn.Parameter(torch.tensor(math.log(ball_radius)))
+        else:
+            self.register_buffer("log_s", torch.tensor(math.log(ball_radius)))
+
+    def forward(
+        self,
+        h_enzyme: Tensor,
+        h_mol: Tensor,
+        enzyme_batch: Optional[Tensor] = None,
+        mol_batch: Optional[Tensor] = None,
+        return_reverse: bool = False,
+    ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+        N_enz, N_mol = h_enzyme.size(0), h_mol.size(0)
+        H, hd = self.n_heads, self.head_dim
+        s = self.log_s.exp()
+        s_val = float(s.item())
+
+        # Ball points per head.
+        p = _exp_o(self.q_proj(h_enzyme), s=s).view(N_enz, H, hd).permute(1, 0, 2)
+        q = _exp_o(self.k_proj(h_mol), s=s).view(N_mol, H, hd).permute(1, 0, 2)
+        # All-pairs (H, N_enz, N_mol, hd).
+        p_e = p.unsqueeze(2)                                   # (H, N_enz, 1, hd)
+        q_m = q.unsqueeze(1)                                   # (H, 1, N_mol, hd)
+        v = _log_o(_mobius_add(-p_e, q_m, s=s_val), s=s_val)   # (H, N_enz, N_mol, hd)
+
+        a = self.a.view(H, 1, 1, hd)
+        logits = self.phi((a * v).sum(-1) * self.inv_sqrt_d)  # (H, N_enz, N_mol)
+
+        mask = None
+        if enzyme_batch is not None and mol_batch is not None:
+            mask = enzyme_batch.unsqueeze(1) != mol_batch.unsqueeze(0)
+            logits = logits.masked_fill(mask.unsqueeze(0), float("-inf"))
+
+        attn_fwd = self.dropout(F.softmax(logits, dim=-1))     # (H, N_enz, N_mol)
+        out = torch.einsum("hnm,hmd->hnd", attn_fwd, q)        # gyro values = q
+        out = out.permute(1, 0, 2).contiguous().view(N_enz, self.hidden_dim)
+        h_enz_attended = self.ln(h_enzyme + self.out_proj(out))
+
+        h_mol_attended = None
+        if return_reverse:
+            # Mandatory frame correction G_ji = gyr[q_i, ⊖p_j] on v_{j←i}.
+            Gv = _gyr_torch(q_m, -p_e, v, s=s_val)             # (H, N_enz, N_mol, hd)
+            f = self.phi((a * (-Gv)).sum(-1) * self.inv_sqrt_d)  # (H, N_enz, N_mol)
+            # Measure correction 2d(log γ_{p_j} − log γ_{q_i}); broadcast over pairs.
+            lg_p = -0.5 * (1.0 - (p * p).sum(-1) / (s * s)).clamp(min=1e-9).log()  # (H,N_enz)
+            lg_q = -0.5 * (1.0 - (q * q).sum(-1) / (s * s)).clamp(min=1e-9).log()  # (H,N_mol)
+            jac = 2.0 * hd * (lg_p.unsqueeze(2) - lg_q.unsqueeze(1))  # (H,N_enz,N_mol)
+            rev_logits = (f + jac).permute(0, 2, 1)            # (H, N_mol, N_enz)
+            if mask is not None:
+                rev_logits = rev_logits.masked_fill(mask.t().unsqueeze(0), float("-inf"))
+            attn_rev = self.dropout(F.softmax(rev_logits, dim=-1))
+            rev_out = torch.einsum("hmn,hnd->hmd", attn_rev, p)  # gyro values = p
+            rev_out = rev_out.permute(1, 0, 2).contiguous().view(N_mol, self.hidden_dim)
+            h_mol_base = self.k_proj(h_mol) if self.mol_dim != self.hidden_dim else h_mol
+            h_mol_attended = self.ln(h_mol_base + self.out_proj(rev_out))
+
+        return h_enz_attended, attn_fwd, h_mol_attended
+
+    def extra_repr(self) -> str:
+        return (f"hidden_dim={self.hidden_dim}, mol_dim={self.mol_dim}, "
+                f"n_heads={self.n_heads}, head_dim={self.head_dim}, "
+                f"ball_radius={self.log_s.exp().item():.3f}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -40,6 +40,35 @@ except ImportError:
 # ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
+class AtomRecord:
+    """Minimal atom representation for downstream feature computation.
+
+    Atom-level structure consumed by :class:`tope.data.features.FeatureComputer`
+    to build Ioffe-style physicochemical descriptors.  The curation-layer
+    :class:`ActiveSite` below is residue-level (it only validates that the
+    annotated catalytic residues are present); atom decomposition itself is a
+    Phase-2 / combinatorial-complex concern, which is why this record is kept
+    independent of how ``ActiveSite`` is assembled.
+    """
+
+    serial: int
+    name: str                # atom name, e.g. "CA", "NZ", "FE"
+    element: str             # element symbol, e.g. "C", "N", "FE"
+    residue_name: str        # three-letter code
+    residue_number: int
+    chain_id: str
+    coord: np.ndarray        # shape (3,), Cartesian coordinates in Å
+    occupancy: float = 1.0
+    b_factor: float = 0.0
+    is_hetero: bool = False
+    is_catalytic: bool = False
+
+    @property
+    def residue_id(self) -> str:
+        return f"{self.chain_id}:{self.residue_name}{self.residue_number}"
+
+
+@dataclass
 class ResidueRecord:
     """One residue in the active-site environment."""
 
@@ -59,10 +88,19 @@ class ResidueRecord:
 
 @dataclass
 class ActiveSite:
-    """Validated active-site environment at residue level."""
+    """Validated active-site environment.
+
+    Carries the atom (rank 0) and residue (rank 2) cells of the combinatorial
+    complex *simultaneously* — atoms and residues are not an either/or choice
+    but two ranks of one structure, linked by ``residue_id``.  Residue-level
+    matching is still what validates the M-CSA annotations (it sidesteps the
+    chain-ID mismatch problem), while the atom list carries the rank-0 cells
+    that ``FeatureComputer`` and the complex's incidence maps consume.
+    """
 
     pdb_id: str
     residues: List[ResidueRecord] = field(default_factory=list)
+    atoms: List[AtomRecord] = field(default_factory=list)
     catalytic_residue_ids: Set[str] = field(default_factory=set)
     centroid: Optional[np.ndarray] = None
     radius_used: float = DEFAULT_ACTIVE_SITE_RADIUS
@@ -78,11 +116,60 @@ class ActiveSite:
 
     @property
     def n_atoms(self) -> int:
+        # Prefer the materialised rank-0 cells; fall back to the residue
+        # summary counts when atoms were not populated (residue-only sites).
+        if self.atoms:
+            return len(self.atoms)
         return sum(r.n_atoms for r in self.residues)
 
     def ca_coords_array(self) -> np.ndarray:
-        """Return (N, 3) Cα coordinate matrix."""
+        """Return (N_res, 3) Cα coordinate matrix."""
         return np.array([r.ca_coord for r in self.residues])
+
+    def atoms_array(self) -> np.ndarray:
+        """Return (N_atom, 3) atom coordinate matrix (rank-0 cell positions)."""
+        if not self.atoms:
+            return np.empty((0, 3))
+        return np.array([a.coord for a in self.atoms])
+
+    def atom_residue_incidence(self) -> np.ndarray:
+        """Atom→residue incidence of the combinatorial complex.
+
+        Returns an integer array ``b`` of length ``len(self.atoms)`` where
+        ``b[a]`` is the index into ``self.residues`` of the residue that atom
+        ``a`` belongs to (``-1`` if its parent residue is absent — e.g. an
+        atom retained without its residue summary).  This is the rank-0 →
+        rank-2 membership map the higher-rank cells are assembled from; both
+        sides key on ``residue_id``.
+        """
+        res_index = {r.residue_id: i for i, r in enumerate(self.residues)}
+        return np.array(
+            [res_index.get(a.residue_id, -1) for a in self.atoms], dtype=int
+        )
+
+    @property
+    def elements(self) -> Set[str]:
+        """Set of element symbols present among the rank-0 atom cells."""
+        return {a.element.upper() for a in self.atoms}
+
+    @property
+    def has_metal(self) -> bool:
+        """True if any atom is a biologically common metal."""
+        metals = {"FE", "ZN", "CU", "MN", "MG", "CA", "CO", "NI", "MO", "W"}
+        return bool(self.elements & metals)
+
+    def distance_matrix(self) -> np.ndarray:
+        """Pairwise atom–atom distance matrix (N_atom, N_atom).
+
+        Over the rank-0 atom cells (``atoms_array``); empty when no atoms are
+        populated.  Feeds the radius filtration (see
+        ``ActiveSiteExtractor.compute_filtration_adjacencies``).
+        """
+        coords = self.atoms_array()
+        if coords.shape[0] == 0:
+            return np.empty((0, 0))
+        diff = coords[:, None, :] - coords[None, :, :]
+        return np.sqrt((diff ** 2).sum(axis=-1))
 
 
 # ── Extractor ─────────────────────────────────────────────────────────────────
@@ -183,9 +270,13 @@ class ActiveSiteExtractor:
             cat_coords.append(info["ca_coord"])
         centroid = np.mean(cat_coords, axis=0)
 
-        # Collect all residues within radius
+        # Collect all residues within radius, plus their constituent atoms.
+        # Both ranks are kept on the same ActiveSite so a single object
+        # materialises the atom (rank 0) and residue (rank 2) cells of the
+        # combinatorial complex simultaneously, linked by residue_id.
         matched_set = set(matched_cat)
         records: List[ResidueRecord] = []
+        atom_records: List[AtomRecord] = []
         cat_ids: Set[str] = set()
 
         for key, info in residue_lookup.items():
@@ -205,12 +296,17 @@ class ActiveSiteExtractor:
                 role=cat_roles.get(key, ""),
             )
             records.append(rec)
+            # Atoms inherit the catalytic flag of their parent residue.
+            for atom in info.get("atoms", []):
+                atom.is_catalytic = is_cat
+                atom_records.append(atom)
             if is_cat:
                 cat_ids.add(rec.residue_id)
 
         site = ActiveSite(
             pdb_id=pdb_id,
             residues=records,
+            atoms=atom_records,
             catalytic_residue_ids=cat_ids,
             centroid=centroid,
             radius_used=radius,
@@ -338,12 +434,37 @@ class ActiveSiteExtractor:
                 b_factors = [a.get_bfactor() for a in atoms]
                 mean_b = float(np.mean(b_factors)) if b_factors else 0.0
 
+                # Materialise the rank-0 atom cells alongside the residue
+                # summary.  Atom and residue share residue_id, which is the
+                # atom→residue incidence the combinatorial complex is built on.
+                is_hetero = het_flag.strip() != ""
+                atom_records: List[AtomRecord] = []
+                for a in atoms:
+                    try:
+                        coord = np.array(a.get_vector().get_array(), dtype=np.float64)
+                    except Exception:
+                        coord = np.array(a.get_coord(), dtype=np.float64)
+                    element = (a.element or "").strip() or a.get_name()[0]
+                    atom_records.append(AtomRecord(
+                        serial=int(a.get_serial_number() or 0),
+                        name=a.get_name().strip(),
+                        element=element,
+                        residue_name=resname,
+                        residue_number=resnum,
+                        chain_id=chain_id,
+                        coord=coord,
+                        occupancy=float(a.get_occupancy() or 1.0),
+                        b_factor=float(a.get_bfactor() or 0.0),
+                        is_hetero=is_hetero,
+                    ))
+
                 key = (chain_id, resnum)
                 residue_lookup[key] = {
                     "resname": resname,
                     "ca_coord": ca_coord,
                     "mean_b": mean_b,
                     "n_atoms": len(atoms),
+                    "atoms": atom_records,
                 }
 
         return residue_lookup, auth_map
@@ -356,3 +477,27 @@ class ActiveSiteExtractor:
         coords = site.ca_coords_array()
         diff = coords[:, None, :] - coords[None, :, :]
         return np.sqrt((diff ** 2).sum(axis=-1))
+
+    @staticmethod
+    def compute_filtration_adjacencies(
+        active_site: ActiveSite,
+        radii: Optional[List[float]] = None,
+    ) -> Dict[float, np.ndarray]:
+        """Atom-level adjacency matrices at each filtration radius.
+
+        For each radius ``r`` returns the boolean atom–atom adjacency
+        ``(dist <= r)`` over the rank-0 atom cells — the two-parameter radius
+        sweep the persistent-homology filtration consumes.  Aligned 1:1 with
+        ``active_site.atoms`` (and hence with the saved atom coords / features /
+        atom_residue arrays).
+
+        Returns
+        -------
+        dict mapping radius (float) → (N_atom, N_atom) int32 adjacency matrix.
+        """
+        if radii is None:
+            from tope.data.config import FILTRATION_RADII
+            radii = list(FILTRATION_RADII)
+
+        dist = active_site.distance_matrix()
+        return {float(r): (dist <= r).astype(np.int32) for r in radii}

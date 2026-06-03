@@ -301,6 +301,54 @@ def _build_B_12(face_to_edge: torch.Tensor) -> torch.Tensor:
     return torch.stack([bond_idx, res_idx], dim=0)
 
 
+def _build_B_12_from_atom_residue(
+    edge_index: torch.Tensor,
+    atom_residue: torch.Tensor,
+) -> torch.Tensor:
+    """Build B_12 (bonds→residues) from the curated atom→residue incidence.
+
+    This is the data-driven boundary operator: rather than re-deriving the
+    2-cells from a synthetic face triangulation (``_build_B_12``), each bond
+    inherits its incident residues directly from the residues its two endpoint
+    atoms belong to (``ActiveSite.atom_residue_incidence()``).  A bond ``e =
+    (a_i, a_j)`` is incident to ``residue(a_i)`` and ``residue(a_j)``; when both
+    endpoints share a residue (an intra-residue bond) the single membership is
+    emitted once.
+
+    Parameters
+    ----------
+    edge_index   : (2, E)  atom adjacency (the rank-1 bonds).
+    atom_residue : (N,)    residue index per atom (-1 if the atom's parent
+                           residue is absent — such endpoints are skipped).
+
+    Returns
+    -------
+    B_12 : (2, E_12)  B_12[0] = bond indices, B_12[1] = residue indices, with
+           duplicate (bond, residue) pairs removed.
+    """
+    E = edge_index.size(1)
+    if E == 0:
+        return edge_index.new_zeros(2, 0)
+    src, dst = edge_index
+    bond_idx = torch.arange(E, device=edge_index.device)
+    res_src = atom_residue[src]
+    res_dst = atom_residue[dst]
+
+    bonds = torch.cat([bond_idx, bond_idx])
+    residues = torch.cat([res_src, res_dst])
+    # Drop endpoints whose parent residue is absent.
+    valid = residues >= 0
+    bonds, residues = bonds[valid], residues[valid]
+    if bonds.numel() == 0:
+        return edge_index.new_zeros(2, 0)
+
+    # Deduplicate (bond, residue) pairs (intra-residue bonds map both endpoints
+    # to the same residue).
+    pairs = torch.stack([bonds, residues], dim=0)
+    pairs = torch.unique(pairs, dim=1)
+    return pairs
+
+
 # ── Single TCPNet layer ──────────────────────────────────────────────────────
 
 class TCPNetLayer(nn.Module):
@@ -482,8 +530,13 @@ class EnzymeTCPNet(nn.Module):
             pos           : (N, 3)
             B_01          : (2, E_01)     — atoms→bonds incidence (optional; derived if absent)
             B_12          : (2, E_12)     — bonds→residues incidence (optional; derived if absent)
+            atom_residue  : (N,) or None  — curated atom→residue membership
+                            (ActiveSite.atom_residue_incidence()).  When present
+                            it drives B_12 directly (preferred over face_to_edge),
+                            so the curated complex defines the rank-2 boundary
+                            operator instead of the model re-deriving it.
             face_features : (F, face_feat_dim) or None
-            face_to_edge  : (3, F) or None   — used to synthesize B_12 / h_faces if needed
+            face_to_edge  : (3, F) or None   — synthetic B_12 / h_faces fallback
             batch         : (N,)              — graph membership (optional, for batching)
 
         Returns
@@ -507,8 +560,15 @@ class EnzymeTCPNet(nn.Module):
             B_01 = _build_B_01(edge_index)
 
         # ── Build / retrieve B_12 ─────────────────────────────────────────────
+        # Preference order: explicit B_12 > curated atom→residue incidence >
+        # synthetic face triangulation.  The atom_residue path lets the curated
+        # complex drive the rank-2 boundary operator directly, instead of the
+        # model re-deriving residues from a face_to_edge proxy.
+        atom_residue = enzyme_pcc.get("atom_residue")
         if "B_12" in enzyme_pcc:
             B_12 = enzyme_pcc["B_12"]
+        elif atom_residue is not None and atom_residue.numel() > 0:
+            B_12 = _build_B_12_from_atom_residue(edge_index, atom_residue)
         elif face_to_edge is not None and face_to_edge.numel() > 0:
             B_12 = _build_B_12(face_to_edge)
         else:
