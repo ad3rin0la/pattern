@@ -40,6 +40,35 @@ except ImportError:
 # ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
+class AtomRecord:
+    """Minimal atom representation for downstream feature computation.
+
+    Atom-level structure consumed by :class:`tope.data.features.FeatureComputer`
+    to build Ioffe-style physicochemical descriptors.  The curation-layer
+    :class:`ActiveSite` below is residue-level (it only validates that the
+    annotated catalytic residues are present); atom decomposition itself is a
+    Phase-2 / combinatorial-complex concern, which is why this record is kept
+    independent of how ``ActiveSite`` is assembled.
+    """
+
+    serial: int
+    name: str                # atom name, e.g. "CA", "NZ", "FE"
+    element: str             # element symbol, e.g. "C", "N", "FE"
+    residue_name: str        # three-letter code
+    residue_number: int
+    chain_id: str
+    coord: np.ndarray        # shape (3,), Cartesian coordinates in Å
+    occupancy: float = 1.0
+    b_factor: float = 0.0
+    is_hetero: bool = False
+    is_catalytic: bool = False
+
+    @property
+    def residue_id(self) -> str:
+        return f"{self.chain_id}:{self.residue_name}{self.residue_number}"
+
+
+@dataclass
 class ResidueRecord:
     """One residue in the active-site environment."""
 
