@@ -22,6 +22,7 @@ from tope.data.pipeline import CurationPipeline
 from tope.data.config import CurationConfig, PipelineConfig
 from tope.data.kinetics_client import KineticsAggregator
 from tope.data.active_site import (
+    AtomRecord,
     ResidueRecord,
     ActiveSite,
     ActiveSiteExtractor,
@@ -30,6 +31,7 @@ from tope.data.mcsa_client import MCSAClient, MCSAEntry, CatalyticResidue
 from tope.data.pdb_client import PDBClient
 from tope.data.features import FeatureComputer, ActiveSiteFeatures
 from tope.data.dataset import DatasetBuilder, DatasetRecord
+from tope.data.loader import ToPEDataset, collate_enzyme_pcc
 from tope.data.topec_ingestion import (
     IngestionConfig,
     ToPERecord,
@@ -54,6 +56,7 @@ __all__ = [
     "PipelineConfig",
     "KineticsAggregator",
     # Active site extraction
+    "AtomRecord",
     "ResidueRecord",
     "ActiveSite",
     "ActiveSiteExtractor",
@@ -68,6 +71,9 @@ __all__ = [
     # Dataset
     "DatasetBuilder",
     "DatasetRecord",
+    # Model-input loader (curate→train bridge)
+    "ToPEDataset",
+    "collate_enzyme_pcc",
     # TopEC ingestion
     "IngestionConfig",
     "ToPERecord",
