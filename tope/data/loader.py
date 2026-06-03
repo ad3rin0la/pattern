@@ -42,6 +42,8 @@ except ImportError:  # pragma: no cover - torch is a core dep in practice
     HAS_TORCH = False
     Dataset = object  # type: ignore
 
+from tope.data.molecule import MoleculeFeaturizer, smiles_to_graph
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Edge construction / featurisation
@@ -122,6 +124,10 @@ class ToPEDataset(Dataset):
     edge_feat_dim : number of Gaussian RBF bins for ``edge_features``.
     max_neighbors : optional out-degree cap for the bond graph.
     split : optional filter ("train"/"val"/"test") applied to the records.
+    with_molecules : also emit ``substrate``/``product`` graphs (featurised from
+        the persisted SMILES) so the cross-attention + kinetics/selectivity
+        heads have inputs.  Missing/invalid SMILES degrade to a dummy atom.
+    mol_featurizer : molecule featuriser (defaults to MoleculeFeaturizer).
     """
 
     def __init__(
@@ -132,6 +138,8 @@ class ToPEDataset(Dataset):
         edge_feat_dim: int = 32,
         max_neighbors: Optional[int] = None,
         split: Optional[str] = None,
+        with_molecules: bool = False,
+        mol_featurizer: Optional[MoleculeFeaturizer] = None,
     ) -> None:
         if not HAS_TORCH:
             raise ImportError("ToPEDataset requires torch.")
@@ -139,6 +147,8 @@ class ToPEDataset(Dataset):
         self.edge_radius = edge_radius
         self.edge_feat_dim = edge_feat_dim
         self.max_neighbors = max_neighbors
+        self.with_molecules = with_molecules
+        self.mol_featurizer = mol_featurizer or MoleculeFeaturizer()
 
         recs = [r if isinstance(r, dict) else _record_to_dict(r) for r in records]
         if split is not None:
@@ -193,10 +203,24 @@ class ToPEDataset(Dataset):
             "batch": torch.zeros(n, dtype=torch.long),
             "n_residues": n_residues,
         }
-        return {
+        sample = {
             "enzyme_pcc": enzyme_pcc,
             "pdb_id": r.get("pdb_id", ""),
             "labels": _labels_from_record(r),
+        }
+        if self.with_molecules:
+            sample["substrate"] = self._mol_graph(r.get("substrate_smiles", ""))
+            sample["product"] = self._mol_graph(r.get("product_smiles", ""))
+        return sample
+
+    def _mol_graph(self, smiles: str) -> Dict[str, "torch.Tensor"]:
+        """Featurise a SMILES string into a substrate/product graph dict."""
+        feats, edge_index = smiles_to_graph(smiles, self.mol_featurizer)
+        m = feats.shape[0]
+        return {
+            "node_features": torch.tensor(feats, dtype=torch.float32),
+            "edge_index": torch.tensor(edge_index, dtype=torch.long),
+            "batch": torch.zeros(m, dtype=torch.long),
         }
 
     @property
@@ -205,6 +229,11 @@ class ToPEDataset(Dataset):
         if not self.records:
             return 0
         return int(self._load(self.records[0]["features_path"]).shape[1])
+
+    @property
+    def mol_feat_dim(self) -> int:
+        """Feature width of the substrate/product node features."""
+        return self.mol_featurizer.feat_dim
 
 
 def _labels_from_record(r: Dict[str, Any]) -> Dict[str, Any]:
@@ -276,7 +305,7 @@ def collate_enzyme_pcc(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         "batch": torch.cat(batch_vec, dim=0),
         "n_residues": res_offset,
     }
-    return {
+    batch = {
         "enzyme_pcc": enzyme_pcc,
         "pdb_id": pdb_ids,
         "labels": {
@@ -284,4 +313,26 @@ def collate_enzyme_pcc(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
             "ec_top_level": ec_tops,
             "kinetics": torch.tensor(kinetics, dtype=torch.float32),
         },
+    }
+    # Substrate / product molecule graphs (present iff the dataset emitted them).
+    if samples and "substrate" in samples[0]:
+        batch["substrate"] = _collate_mol_graphs([s["substrate"] for s in samples])
+        batch["product"] = _collate_mol_graphs([s["product"] for s in samples])
+    return batch
+
+
+def _collate_mol_graphs(graphs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Disjoint-union batching for substrate/product molecule graphs."""
+    node_feats, edge_indices, batch_vec = [], [], []
+    offset = 0
+    for g, graph in enumerate(graphs):
+        m = graph["node_features"].size(0)
+        node_feats.append(graph["node_features"])
+        edge_indices.append(graph["edge_index"] + offset)
+        batch_vec.append(torch.full((m,), g, dtype=torch.long))
+        offset += m
+    return {
+        "node_features": torch.cat(node_feats, dim=0),
+        "edge_index": torch.cat(edge_indices, dim=1) if edge_indices else torch.zeros(2, 0, dtype=torch.long),
+        "batch": torch.cat(batch_vec, dim=0),
     }

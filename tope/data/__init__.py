@@ -32,6 +32,7 @@ from tope.data.pdb_client import PDBClient
 from tope.data.features import FeatureComputer, ActiveSiteFeatures
 from tope.data.dataset import DatasetBuilder, DatasetRecord
 from tope.data.loader import ToPEDataset, collate_enzyme_pcc
+from tope.data.molecule import MoleculeFeaturizer, smiles_to_graph
 from tope.data.topec_ingestion import (
     IngestionConfig,
     ToPERecord,
@@ -74,6 +75,9 @@ __all__ = [
     # Model-input loader (curate→train bridge)
     "ToPEDataset",
     "collate_enzyme_pcc",
+    # Molecule featurisation (substrate/product graphs)
+    "MoleculeFeaturizer",
+    "smiles_to_graph",
     # TopEC ingestion
     "IngestionConfig",
     "ToPERecord",
