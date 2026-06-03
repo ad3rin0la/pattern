@@ -63,6 +63,7 @@ class DatasetRecord:
     features_path: str = ""
     mask_path: str = ""
     adjacency_dir: str = ""
+    atom_residue_path: str = ""   # rank-0 → rank-2 incidence (drives B_12)
 
     # Kinetics labels (log10 values; None if unavailable)
     log_kcat: Optional[float] = None       # log10(kcat / s⁻¹)
@@ -149,10 +150,15 @@ class DatasetBuilder:
             coords_path = sample_dir / "coords.npy"
             features_path = sample_dir / "features.npy"
             mask_path = sample_dir / "catalytic_mask.npy"
+            atom_residue_path = sample_dir / "atom_residue.npy"
 
             np.save(str(coords_path), feats.coords)
             np.save(str(features_path), feats.feature_matrix)
             np.save(str(mask_path), feats.catalytic_mask)
+            # Persist the atom→residue incidence (rank-0 → rank-2 membership)
+            # so the curated complex — not the model — defines B_12 downstream.
+            # Aligned 1:1 with the saved atom coords / features ordering.
+            np.save(str(atom_residue_path), site.atom_residue_incidence())
 
             # Save filtration adjacency matrices
             adj_dir = sample_dir / "adjacency"
@@ -183,6 +189,7 @@ class DatasetBuilder:
                 features_path=str(features_path.relative_to(self.features_dir)),
                 mask_path=str(mask_path.relative_to(self.features_dir)),
                 adjacency_dir=str(adj_dir.relative_to(self.features_dir)),
+                atom_residue_path=str(atom_residue_path.relative_to(self.features_dir)),
                 log_kcat=log_kcat,
                 log_km=log_km,
                 log_kcat_km=log_kcat_km,
@@ -401,6 +408,7 @@ class DatasetBuilder:
             "features_path": r.features_path,
             "mask_path": r.mask_path,
             "adjacency_dir": r.adjacency_dir,
+            "atom_residue_path": r.atom_residue_path,
             "log_kcat": r.log_kcat,
             "log_km": r.log_km,
             "log_kcat_km": r.log_kcat_km,

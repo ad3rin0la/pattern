@@ -147,6 +147,30 @@ class ActiveSite:
             [res_index.get(a.residue_id, -1) for a in self.atoms], dtype=int
         )
 
+    @property
+    def elements(self) -> Set[str]:
+        """Set of element symbols present among the rank-0 atom cells."""
+        return {a.element.upper() for a in self.atoms}
+
+    @property
+    def has_metal(self) -> bool:
+        """True if any atom is a biologically common metal."""
+        metals = {"FE", "ZN", "CU", "MN", "MG", "CA", "CO", "NI", "MO", "W"}
+        return bool(self.elements & metals)
+
+    def distance_matrix(self) -> np.ndarray:
+        """Pairwise atom–atom distance matrix (N_atom, N_atom).
+
+        Over the rank-0 atom cells (``atoms_array``); empty when no atoms are
+        populated.  Feeds the radius filtration (see
+        ``ActiveSiteExtractor.compute_filtration_adjacencies``).
+        """
+        coords = self.atoms_array()
+        if coords.shape[0] == 0:
+            return np.empty((0, 0))
+        diff = coords[:, None, :] - coords[None, :, :]
+        return np.sqrt((diff ** 2).sum(axis=-1))
+
 
 # ── Extractor ─────────────────────────────────────────────────────────────────
 
@@ -453,3 +477,27 @@ class ActiveSiteExtractor:
         coords = site.ca_coords_array()
         diff = coords[:, None, :] - coords[None, :, :]
         return np.sqrt((diff ** 2).sum(axis=-1))
+
+    @staticmethod
+    def compute_filtration_adjacencies(
+        active_site: ActiveSite,
+        radii: Optional[List[float]] = None,
+    ) -> Dict[float, np.ndarray]:
+        """Atom-level adjacency matrices at each filtration radius.
+
+        For each radius ``r`` returns the boolean atom–atom adjacency
+        ``(dist <= r)`` over the rank-0 atom cells — the two-parameter radius
+        sweep the persistent-homology filtration consumes.  Aligned 1:1 with
+        ``active_site.atoms`` (and hence with the saved atom coords / features /
+        atom_residue arrays).
+
+        Returns
+        -------
+        dict mapping radius (float) → (N_atom, N_atom) int32 adjacency matrix.
+        """
+        if radii is None:
+            from tope.data.config import FILTRATION_RADII
+            radii = list(FILTRATION_RADII)
+
+        dist = active_site.distance_matrix()
+        return {float(r): (dist <= r).astype(np.int32) for r in radii}

@@ -40,6 +40,7 @@ _stub_pkg("tope.data", _REPO_ROOT / "tope" / "data")
 _config = importlib.import_module("tope.data.config")
 _active_site = importlib.import_module("tope.data.active_site")
 _features = importlib.import_module("tope.data.features")
+_dataset = importlib.import_module("tope.data.dataset")
 
 
 def test_atomrecord_exists_with_feature_contract():
@@ -135,3 +136,78 @@ def test_feature_computer_consumes_the_atom_rank():
     assert result.catalytic_mask.tolist() == [True, True, False]
     # Atom-level feature records preserve the residue linkage.
     assert result.atom_features[0].residue_id == "A:HIS57"
+
+
+# ── Restored dataset-layer members (refactor debt) ────────────────────────────
+
+def _metal_site():
+    AtomRecord = _active_site.AtomRecord
+    ResidueRecord = _active_site.ResidueRecord
+    ActiveSite = _active_site.ActiveSite
+    residues = [ResidueRecord("A", "CYS", 10, np.zeros(3), n_atoms=2, is_catalytic=True)]
+    atoms = [
+        AtomRecord(1, "SG", "S", "CYS", 10, "A", np.array([0.0, 0.0, 0.0])),
+        AtomRecord(2, "FE", "FE", "FES", 11, "A", np.array([2.0, 0.0, 0.0])),
+    ]
+    return ActiveSite(pdb_id="MET", residues=residues, atoms=atoms)
+
+
+def test_elements_and_has_metal():
+    site = _metal_site()
+    assert site.elements == {"S", "FE"}
+    assert site.has_metal is True
+    # A non-metal site
+    plain = _toy_site()
+    assert plain.has_metal is False
+
+
+def test_distance_matrix_and_filtration_adjacencies():
+    site = _toy_site()  # 3 atoms
+    D = site.distance_matrix()
+    assert D.shape == (3, 3)
+    np.testing.assert_allclose(np.diag(D), 0.0, atol=1e-12)
+    np.testing.assert_allclose(D, D.T)  # symmetric
+
+    adjs = _active_site.ActiveSiteExtractor.compute_filtration_adjacencies(
+        site, radii=[0.05, 10.0]
+    )
+    assert set(adjs) == {0.05, 10.0}
+    # Tiny radius → only self-adjacency; large radius → fully connected.
+    assert adjs[0.05].dtype == np.int32
+    assert int(adjs[0.05].sum()) == 3        # diagonal only
+    assert (adjs[10.0] == 1).all()
+
+
+def test_dataset_build_persists_atom_residue(tmp_path):
+    """Full DatasetBuilder.build round-trip writes atom_residue.npy aligned with
+    the saved atom features, and records its path — so the incidence survives to
+    disk and can drive tcpnet's B_12 downstream."""
+    site = _toy_site()
+    feats = _features.FeatureComputer(compute_sasa=False, normalise=False).compute(site)
+
+    PipelineConfig = _config.PipelineConfig
+    builder = _dataset.DatasetBuilder(
+        output_dir=tmp_path / "processed",
+        features_dir=tmp_path / "features",
+        config=PipelineConfig(output_format="json"),
+    )
+    records = builder.build([site], [feats], split_ratios=(0.0, 0.0, 1.0))
+    assert len(records) == 1
+    rec = records[0]
+
+    # The record carries the new path, and it points at a real array.
+    assert rec.atom_residue_path
+    arr_path = (tmp_path / "features") / rec.atom_residue_path
+    assert arr_path.exists()
+    loaded = np.load(arr_path)
+    np.testing.assert_array_equal(loaded, site.atom_residue_incidence())
+
+    # Aligned 1:1 with the saved atom features / coords.
+    assert loaded.shape[0] == feats.feature_matrix.shape[0] == site.n_atoms
+    # Restored summary fields populate the record.
+    assert rec.n_atoms == 3 and rec.n_residues == 2
+    assert rec.has_metal is False
+
+    # Serialised dict includes the new field.
+    d = _dataset.DatasetBuilder._record_to_dict(rec)
+    assert "atom_residue_path" in d
