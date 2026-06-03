@@ -32,6 +32,7 @@ from tope.quantum.voip_siren import (
     AttentiveVOIPEncoder,
     VOIPSheafSectionBuilder,
 )
+from tope.quantum.gyro_dnc import GyroMemory
 
 __all__ = [
     "VOIPSIRENConfig",
@@ -44,4 +45,6 @@ __all__ = [
     "SpectralPosEncoding",
     "AttentiveVOIPEncoder",
     "VOIPSheafSectionBuilder",
+    # Phase 5G
+    "GyroMemory",
 ]
