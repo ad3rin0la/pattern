@@ -15,6 +15,11 @@ from tope.training.losses import (
     MultiTaskLoss,
     EnhancedMultiTaskLoss,
 )
+from tope.training.labels import (
+    ECVocabulary,
+    encode_targets,
+    active_tasks_for,
+)
 from tope.training.evaluation import (
     MetricAccumulator,
     FiltrationAttribution,
@@ -31,6 +36,10 @@ __all__ = [
     "ECHierarchyConsistencyLoss",
     "MultiTaskLoss",
     "EnhancedMultiTaskLoss",
+    # Label encoding (curated labels → training targets)
+    "ECVocabulary",
+    "encode_targets",
+    "active_tasks_for",
     # Evaluation
     "MetricAccumulator",
     "FiltrationAttribution",
