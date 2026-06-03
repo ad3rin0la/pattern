@@ -50,6 +50,13 @@ _load("tope.topology.g_structure", _REPO_ROOT / "tope" / "topology" / "g_structu
 cca = _load("tope.models.cc_attention", _REPO_ROOT / "tope" / "models" / "cc_attention.py")
 
 
+@pytest.fixture(autouse=True)
+def _seed():
+    # Deterministic inputs so the threshold-based assertions never flake on an
+    # unlucky random draw (e.g. features landing where gyration ≈ identity).
+    torch.manual_seed(0)
+
+
 def test_gyro_available():
     assert cca.HAS_GYRO, "gyro_memory import failed inside cc_attention"
 

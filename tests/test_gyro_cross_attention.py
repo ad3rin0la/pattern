@@ -49,6 +49,12 @@ cax = _load(
 )
 
 
+@pytest.fixture(autouse=True)
+def _seed():
+    # Deterministic inputs so threshold-based assertions never flake.
+    torch.manual_seed(0)
+
+
 def test_gyro_available():
     assert cax.HAS_GYRO
 
