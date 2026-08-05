@@ -24,12 +24,13 @@ def predict():
     import json
     import torch
 
-    from tope.models import ToPEModel
+    from tope.models import CompleteToPEModel, CompleteToPEConfig
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model = ToPEModel(checkpoint["config"])
+    cfg = checkpoint.get("config", CompleteToPEConfig())
+    model = CompleteToPEModel(cfg)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()

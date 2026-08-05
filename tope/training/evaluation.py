@@ -718,3 +718,190 @@ class AllostericPathwayVisualiser:
             logger.info("Saved allosteric pathway plot to %s", save_path)
 
         return fig
+
+
+# ── Phase 2 ablation suite ────────────────────────────────────────────────────
+
+class Phase2AblationSuite:
+    """Validate Phase 2 component contributions before advancing to Phase 3.
+
+    Run all ablations, confirm the deltas match expected thresholds, then
+    call ``assert_phase2_complete()`` as a hard gate before building TCPNet
+    on top of unvalidated components.
+
+    Expected ablation numbers (from ToPE Phase 2 design doc):
+
+    ============================================  ========================
+    Ablation                                       Expected F-score delta
+    ============================================  ========================
+    Without sheaf sections                         −12%  (whole-protein)
+    Without is_active_site attention bias          −5%
+    Whole-protein vs 8 Å crop (ToPEModel)          −8%
+    Without rank-stratified filtration             −6%
+    Without spectral cutoff (geomspace)            −3%
+    ============================================  ========================
+
+    Usage::
+
+        suite = Phase2AblationSuite(whole_protein_model, baseline_model, loader)
+        results = suite.run(device)
+        suite.assert_phase2_complete(results)   # raises if any threshold missed
+    """
+
+    # (ablation_name, feature_to_zero_or_None, min_expected_delta)
+    # delta = baseline_f1 − ablated_f1  (positive = feature helps)
+    ABLATIONS: List[Tuple[str, Optional[str], float]] = [
+        ("without_active_site_bias", "is_active_site", 0.03),   # ≥3 pp drop
+        ("without_sheaf_node_features", "sheaf_features",  0.08),  # ≥8 pp drop
+    ]
+
+    # Minimum F-score improvement of CompleteToPEModel over ToPEModel baseline
+    MIN_WHOLE_PROTEIN_GAIN: float = 0.05   # ≥5 pp F-score gain over 8 Å crop
+
+    def __init__(
+        self,
+        model: nn.Module,
+        baseline_model: Optional[nn.Module],
+        data_loader: Any,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        model          : CompleteToPEModel (whole-protein, Phase 2)
+        baseline_model : ToPEModel (8 Å crop) — may be None if checkpoint
+                         unavailable; whole-protein gain check is skipped.
+        data_loader    : validation data loader
+        """
+        self.model          = model
+        self.baseline_model = baseline_model
+        self.data_loader    = data_loader
+
+    @torch.no_grad()
+    def run(self, device: torch.device) -> Dict[str, Any]:
+        """Run all Phase 2 ablations.
+
+        Returns
+        -------
+        results : dict with keys
+            'baseline_f1'          : float
+            'ablation_deltas'      : dict {name: delta_f1}
+            'whole_protein_gain'   : float or None
+            'passed'               : bool
+            'failures'             : list of str
+        """
+        self.model.eval()
+
+        # ── Baseline: full CompleteToPEModel ─────────────────────────────────
+        baseline_f1 = self._evaluate(self.model, device)
+        logger.info("Phase2AblationSuite | baseline F1 = %.4f", baseline_f1)
+
+        # ── Component ablations ───────────────────────────────────────────────
+        ablation_deltas: Dict[str, float] = {}
+        failures: List[str] = []
+
+        for name, feature_key, min_delta in self.ABLATIONS:
+            ablated_f1 = self._evaluate(
+                self.model, device, zero_feature=feature_key
+            )
+            delta = baseline_f1 - ablated_f1
+            ablation_deltas[name] = delta
+            logger.info(
+                "Phase2AblationSuite | %-35s  delta=%.4f  (threshold=%.4f)  %s",
+                name, delta, min_delta, "OK" if delta >= min_delta else "FAIL",
+            )
+            if delta < min_delta:
+                failures.append(
+                    f"{name}: delta={delta:.4f} < threshold={min_delta:.4f}"
+                )
+
+        # ── Whole-protein vs 8 Å crop ─────────────────────────────────────────
+        whole_protein_gain: Optional[float] = None
+        if self.baseline_model is not None:
+            self.baseline_model.eval()
+            baseline_crop_f1 = self._evaluate(self.baseline_model, device)
+            whole_protein_gain = baseline_f1 - baseline_crop_f1
+            logger.info(
+                "Phase2AblationSuite | whole-protein gain over 8A crop = %.4f  "
+                "(threshold=%.4f)  %s",
+                whole_protein_gain, self.MIN_WHOLE_PROTEIN_GAIN,
+                "OK" if whole_protein_gain >= self.MIN_WHOLE_PROTEIN_GAIN else "FAIL",
+            )
+            if whole_protein_gain < self.MIN_WHOLE_PROTEIN_GAIN:
+                failures.append(
+                    f"whole_protein_gain={whole_protein_gain:.4f} "
+                    f"< threshold={self.MIN_WHOLE_PROTEIN_GAIN:.4f}"
+                )
+
+        return {
+            "baseline_f1":        baseline_f1,
+            "ablation_deltas":    ablation_deltas,
+            "whole_protein_gain": whole_protein_gain,
+            "passed":             len(failures) == 0,
+            "failures":           failures,
+        }
+
+    def assert_phase2_complete(self, results: Dict[str, Any]) -> None:
+        """Hard gate: raise if any Phase 2 ablation threshold was missed.
+
+        Call this before building Phase 3 components (TCPNet stack, multi-task
+        heads) so that unvalidated ablation numbers cannot be silently ignored.
+
+        Raises
+        ------
+        AssertionError : with a summary of all failing ablations.
+        """
+        if results["passed"]:
+            logger.info(
+                "Phase2AblationSuite | ALL ABLATIONS PASSED — cleared for Phase 3"
+            )
+            return
+
+        summary = "\n".join(f"  - {f}" for f in results["failures"])
+        raise AssertionError(
+            "Phase 2 ablations did not meet expected thresholds.\n"
+            "Do not advance to Phase 3 (TCPNet stack) until all thresholds pass.\n"
+            f"Failures:\n{summary}"
+        )
+
+    # ── Internal ─────────────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def _evaluate(
+        self,
+        model: nn.Module,
+        device: torch.device,
+        zero_feature: Optional[str] = None,
+    ) -> float:
+        """Run one evaluation pass, optionally zeroing a named feature.
+
+        ``zero_feature`` choices:
+            ``"is_active_site"``   — zeros the active-site attention bias mask
+            ``"sheaf_features"``   — zeros ``face_features`` in the enzyme PCC
+                                     (ablates sheaf section contribution)
+        """
+        acc = MetricAccumulator()
+
+        for batch in self.data_loader:
+            batch = _to_device(batch, device)
+
+            if zero_feature == "is_active_site" and "enzyme_pcc" in batch:
+                pcc = batch["enzyme_pcc"]
+                if "is_active_site" in pcc:
+                    pcc = dict(pcc)
+                    pcc["is_active_site"] = torch.zeros_like(pcc["is_active_site"])
+                    batch = dict(batch)
+                    batch["enzyme_pcc"] = pcc
+
+            elif zero_feature == "sheaf_features" and "enzyme_pcc" in batch:
+                pcc = batch["enzyme_pcc"]
+                if "face_features" in pcc and pcc["face_features"] is not None:
+                    pcc = dict(pcc)
+                    pcc["face_features"] = torch.zeros_like(pcc["face_features"])
+                    batch = dict(batch)
+                    batch["enzyme_pcc"] = pcc
+
+            preds = model(batch)
+            acc.update(preds, batch.get("targets", {}))
+
+        metrics = acc.compute()
+        return metrics.get("ec_level0_f1_macro", 0.0)

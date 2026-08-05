@@ -117,6 +117,11 @@ def test_import_training():
     )
 
 
+def test_import_bidirectional_physics():
+    from tope.models import BidirectionalPhysicsConfig, BidirectionalPhysicsToPE
+    from tope.training import BidirectionalLossConfig, BidirectionalPhysicsLoss
+
+
 def test_import_topology():
     """Test importing topology components."""
     from tope.topology import (

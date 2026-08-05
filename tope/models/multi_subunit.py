@@ -1175,10 +1175,18 @@ class AllostericCooperativityHead(nn.Module):
     Also predicts:
     - T/R state bias (allosteric two-state model)
     - Inter-subunit communication strength
+    - ADP field (via TLS decomposition when tls_groups provided)
     """
 
     def __init__(self, hidden_dim: int = 256):
         super().__init__()
+        # Residual network for anharmonic correction to TLS-predicted ADP
+        # Input: subunit embedding + atom position encoding → 6 ADP components
+        self.residual_net = nn.Sequential(
+            nn.Linear(hidden_dim + 3, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 6),   # 6 independent ADP components (symmetric 3×3)
+        )
 
         # Subunit interaction encoder
         self.subunit_pair_encoder = nn.Sequential(
@@ -1216,6 +1224,75 @@ class AllostericCooperativityHead(nn.Module):
             nn.Linear(32, 1),
             nn.Sigmoid(),
         )
+
+    def predict_adp_field(
+        self,
+        h_subunits: torch.Tensor,    # [n_subunits, H] or [batch, n_subunits, H]
+        tls_groups: List[Any],
+        atom_coords_list: List[Any],  # list of (N_atoms_i, 3) arrays per subunit
+    ) -> List[torch.Tensor]:
+        """Predict per-atom ADP tensors using TLS decomposition + neural residual.
+
+        For each atom, the predicted ADP is:
+            U_i = U_i^TLS + U_i^residual
+
+        where U_i^TLS is the rigid-body prediction from the TLS model and
+        U_i^residual is the neural network correction (captures anharmonicity).
+
+        Parameters
+        ----------
+        h_subunits     : subunit embeddings (not used for TLS geometric part,
+                         only for neural residual correction)
+        tls_groups     : list of TLSGroup (one per subunit)
+        atom_coords_list: list of numpy arrays (N_atoms_i, 3) per subunit
+
+        Returns
+        -------
+        adp_predictions : list of (N_atoms_i, 6) tensors (upper-triangular ADP)
+        """
+        try:
+            import numpy as np
+        except ImportError:
+            raise RuntimeError("numpy required for TLS ADP prediction")
+
+        if h_subunits.dim() == 3:
+            h_sub = h_subunits[0]   # use first batch element
+        else:
+            h_sub = h_subunits
+
+        adp_predictions = []
+
+        for subunit_idx, (tls, coords) in enumerate(zip(tls_groups, atom_coords_list)):
+            if subunit_idx >= h_sub.size(0):
+                break
+            h_s = h_sub[subunit_idx]   # (H,)
+
+            subunit_adps = []
+            for atom_coords in coords:
+                r_i = atom_coords - tls.origin
+                # TLS geometric prediction (numpy)
+                U_i_tls = tls.predict_adp(np.asarray(atom_coords))   # (3,3)
+
+                # Neural residual (captures anharmonicity and electronic effects)
+                r_t = torch.tensor(r_i, dtype=torch.float32, device=h_s.device)
+                residual_input = torch.cat([h_s, r_t])                # (H+3,)
+                U_i_residual = self.residual_net(residual_input)       # (6,)
+
+                # Convert TLS prediction to 6-vector (upper triangular)
+                U_tls_vec = torch.tensor(
+                    [U_i_tls[0,0], U_i_tls[1,1], U_i_tls[2,2],
+                     U_i_tls[0,1], U_i_tls[0,2], U_i_tls[1,2]],
+                    dtype=torch.float32,
+                    device=h_s.device,
+                )
+                subunit_adps.append(U_tls_vec + U_i_residual)
+
+            if subunit_adps:
+                adp_predictions.append(torch.stack(subunit_adps))   # (N_atoms_i, 6)
+            else:
+                adp_predictions.append(torch.zeros(0, 6, device=h_sub.device))
+
+        return adp_predictions
 
     def forward(
         self,

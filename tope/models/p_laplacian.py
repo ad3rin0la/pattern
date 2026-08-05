@@ -107,10 +107,14 @@ class LearnablePLaplacianToPE(nn.Module):
         self.config = config or PLaplacianConfig()
 
         self.ranks = self.config.ranks
-        self.filtration_radii = np.linspace(
+        # Logarithmic radii sweep: geomspace encodes shell depth continuously
+        # at the right scale (each octave covers equal physical volume shells).
+        # Replaces the previous np.linspace which over-sampled small radii and
+        # under-sampled the long-range allosteric tail.
+        self.filtration_radii = np.geomspace(
             self.config.radius_min,
             self.config.radius_max,
-            self.config.n_radii
+            self.config.n_radii,
         )
 
         # Learnable p-parameters: (rank × filtration) grid

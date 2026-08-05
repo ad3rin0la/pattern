@@ -427,13 +427,18 @@ class SpectralResidualTTN(nn.Module):
         self.band1 = _BandEncoder(d_voip, d_out, hidden_mul, dropout)
         self.gate1 = _ResidualGate(d_out)
 
-        # Band 2 (optional): Pulay gradient correction (Phase 5B)
+        # Band 2 (Phase 5B): Pulay gradient correction.
+        # DEFERRED — requires geometry-dependent VOIP from Phase 5A, which has
+        # not yet been validated.  Raise immediately so misconfigured callers
+        # fail loudly rather than silently omitting the band.
         if d_pulay is not None:
-            self.band2 = _BandEncoder(d_pulay, d_out, hidden_mul, dropout)
-            self.gate2 = _ResidualGate(d_out)
-        else:
-            self.band2 = None
-            self.gate2 = None
+            raise NotImplementedError(
+                "SpectralResidualTTN: d_pulay (Phase 5B Pulay gradient band) is "
+                "deferred until Phase 5A (AttentiveVOIPEncoder) is complete and "
+                "validated.  Pass d_pulay=None to use the two-band baseline."
+            )
+        self.band2 = None
+        self.gate2 = None
 
         # Final LayerNorm over the accumulated representation
         self.norm_out = nn.LayerNorm(d_out)

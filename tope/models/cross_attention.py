@@ -23,6 +23,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import math as _math
+
+try:
+    from tope.compression.gyro_qjl import TangentSpaceQJL, log_map_zero
+    HAS_GYRO_QJL = True
+except ImportError:
+    HAS_GYRO_QJL = False
+    def log_map_zero(x, c=1.0):  # fallback: identity (approximate for small norms)
+        x_norm = x.norm(dim=-1, keepdim=True).clamp(min=1e-7)
+        return torch.arctanh(x_norm.clamp(max=1.0 - 1e-5)) * (x / x_norm)
+
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -180,7 +191,52 @@ class MultiHeadCrossAttention(nn.Module):
         K = K.permute(1, 0, 2)  # (n_heads, N_kv, head_dim)
         V = V.permute(1, 0, 2)  # (n_heads, N_kv, head_dim)
 
-        attn_logits = torch.bmm(Q, K.transpose(1, 2)) * self.scale  # (n_heads, N_q, N_kv)
+        # ── Site A: Tangent-space QJL — correct hyperbolic inner product ────────
+        # Q and K may have been projected to 𝔹ᵈ upstream.  Computing
+        # torch.bmm(Q, K.T) would be a Euclidean dot product on hyperbolic
+        # features — geometrically wrong.  We must first map Q and K to the
+        # flat tangent space at 0 via log_0, then compute the inner product
+        # there.  TangentSpaceQJL is a drop-in replacement that does this at
+        # 3.5 bits/channel with zero curvature bias (Site A, Gyro-QJL §2.3).
+        #
+        # Q_tan = log_0(Q)  ∈  T_0 𝔹ᵈ  ≅  ℝᵈ  (Euclidean)
+        # K_tan = log_0(K)  ∈  T_0 𝔹ᵈ  ≅  ℝᵈ
+        # attn_logit(i,j) = ⟨Q_tan[i], K_tan[j]⟩  (correct hyperbolic IP)
+        #
+        # With Gyro-QJL: K_tan is encoded to 3.5 bits once per enzyme and
+        # reused across all substrate queries (MultiSubstrateCrossAttention).
+
+        # Project to flat tangent space — log_0 works element-wise on last dim
+        Q_tan = log_map_zero(Q)  # (n_heads, N_q, head_dim)
+        K_tan = log_map_zero(K)  # (n_heads, N_kv, head_dim)
+
+        if HAS_GYRO_QJL:
+            # 3.5-bit compressed path: PolarQuant + QJL residual sketch
+            ts_qjl = TangentSpaceQJL(d=self.head_dim, b=2.5, k=min(256, self.head_dim))
+            n_heads_val, _, hd = Q_tan.shape
+            k_sketch = ts_qjl.qjl.k
+
+            attn_logits_list = []
+            for h in range(n_heads_val):
+                K_h = K_tan[h]   # (N_kv, hd)
+                Q_h = Q_tan[h]   # (N_q, hd)
+
+                # Encode keys once (reused across all queries for this head)
+                K_hat, s_K, _ = ts_qjl.encode(K_h)   # K_hat: (N_kv, hd), s_K: (N_kv, k)
+
+                # Vectorised inner products for all (query, key) pairs:
+                #   stage1 = Q_h @ K_hat.T                         (N_q, N_kv)
+                #   stage2 = (π/2) · (Q_h @ W.T) @ s_K.T / k      (N_q, N_kv)
+                W = ts_qjl.qjl.W.to(K_h.device)        # (k, hd)
+                stage1 = Q_h @ K_hat.T                  # (N_q, N_kv)
+                stage2 = (_math.pi / 2) * (Q_h @ W.T) @ s_K.T / k_sketch  # (N_q, N_kv)
+                attn_logits_list.append((stage1 + stage2) * self.scale)
+
+            attn_logits = torch.stack(attn_logits_list, dim=0)  # (n_heads, N_q, N_kv)
+        else:
+            # Uncompressed path — geometrically correct (tangent-space dot product),
+            # but no compression.  Gyro-QJL import is the preferred production path.
+            attn_logits = torch.bmm(Q_tan, K_tan.transpose(1, 2)) * self.scale
 
         # Mask cross-graph interactions when batching multiple graphs
         if query_batch is not None and kv_batch is not None:
@@ -188,7 +244,13 @@ class MultiHeadCrossAttention(nn.Module):
             mask = query_batch.unsqueeze(1) != kv_batch.unsqueeze(0)  # (N_q, N_kv)
             attn_logits = attn_logits.masked_fill(mask.unsqueeze(0), float("-inf"))
 
+        # A batched enzyme may lack a substrate/product graph. In that case
+        # every key for its query row is masked and softmax(-inf, ...) is NaN.
+        # Treat the missing molecular context as zero attention so the residual
+        # query path remains finite and the sample can still train on other
+        # available labels.
         attn_weights = F.softmax(attn_logits, dim=-1)  # (n_heads, N_q, N_kv)
+        attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
         attn_weights = self.dropout(attn_weights)
 
         attended = torch.bmm(attn_weights, V)  # (n_heads, N_q, head_dim)

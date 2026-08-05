@@ -18,18 +18,23 @@ Quick start::
 
     import tope
 
-    # Load and train a model
-    from tope.models import ToPEModel, ToPEConfig
+    # Load and train a model (Phase 2+: whole-protein pipeline)
+    from tope.models import CompleteToPEModel, CompleteToPEConfig
     from tope.training import ToPETrainer
 
-    model = ToPEModel(ToPEConfig())
+    model = CompleteToPEModel(CompleteToPEConfig())
     trainer = ToPETrainer(model, train_loader, val_loader)
     trainer.fit(n_epochs=100)
+
+Note
+----
+ToPEModel (8 Å active-site crop) is a deprecated ablation baseline.
+Use CompleteToPEModel for all training and inference.
 """
 
 from tope.__version__ import __version__
 
-# Core models (most common imports)
+# Training model (Phase 2+)
 from tope.models import (
     ToPEModel,
     ToPEConfig,
@@ -40,6 +45,8 @@ from tope.models import (
     MultiSubunitToPEModel,
     CompletePToPEModel,
     MemoryOptimizedToPE,
+    BidirectionalPhysicsConfig,
+    BidirectionalPhysicsToPE,
 )
 
 # Training
@@ -47,6 +54,8 @@ from tope.training import (
     ToPETrainer,
     MultiTaskLoss,
     EnhancedMultiTaskLoss,
+    BidirectionalLossConfig,
+    BidirectionalPhysicsLoss,
 )
 
 # Attribution
@@ -80,20 +89,25 @@ from tope.quantum import (
 
 __all__ = [
     "__version__",
-    # Models
-    "ToPEModel",
-    "ToPEConfig",
+    # Training model (Phase 2+)
     "CompleteToPEModel",
     "CompleteToPEConfig",
+    # Ablation baseline - deprecated, not for training
+    "ToPEModel",
+    "ToPEConfig",
     "EnzymeTCPNet",
     "TCPNetLayer",
     "MultiSubunitToPEModel",
     "CompletePToPEModel",
     "MemoryOptimizedToPE",
+    "BidirectionalPhysicsConfig",
+    "BidirectionalPhysicsToPE",
     # Training
     "ToPETrainer",
     "MultiTaskLoss",
     "EnhancedMultiTaskLoss",
+    "BidirectionalLossConfig",
+    "BidirectionalPhysicsLoss",
     # Attribution
     "MultiScaleAttributionAnalyzer",
     "AttributionVisualizer",

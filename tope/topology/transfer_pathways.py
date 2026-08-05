@@ -529,6 +529,55 @@ def visualize_pathways(
     }
 
 
+class TransferPathwayVisualizer:
+    """Callable wrapper around :func:`visualize_pathways` for public API compatibility."""
+
+    def __init__(self, min_confidence: float = 0.5):
+        self.min_confidence = min_confidence
+
+    def visualize(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        edge_index: torch.Tensor,
+        coords: torch.Tensor,
+        pathway_type: PathwayType = PathwayType.ELECTRON_TRANSFER,
+        min_confidence: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        return visualize_pathways(
+            predictions,
+            edge_index,
+            coords,
+            pathway_type=pathway_type,
+            min_confidence=self.min_confidence if min_confidence is None else min_confidence,
+        )
+
+    __call__ = visualize
+
+
+def extract_transfer_pathway_graph(
+    predictions: Dict[str, torch.Tensor],
+    edge_index: torch.Tensor,
+    pathway_type: PathwayType = PathwayType.ELECTRON_TRANSFER,
+    min_confidence: float = 0.5,
+) -> Dict[str, Any]:
+    """Extract high-confidence pathway edges and nodes as a graph dictionary."""
+    type_idx = int(pathway_type)
+    edge_probs = predictions["edge_probs"]
+    node_probs = predictions.get("node_probs")
+    edge_mask = edge_probs[:, type_idx] >= min_confidence
+    selected_edges = edge_index[:, edge_mask]
+    if node_probs is None:
+        selected_nodes = torch.unique(selected_edges)
+    else:
+        selected_nodes = torch.where(node_probs[:, type_idx] >= min_confidence)[0]
+    return {
+        "pathway_type": pathway_type.name,
+        "edge_index": selected_edges,
+        "node_index": selected_nodes,
+        "edge_confidence": edge_probs[edge_mask, type_idx],
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Integration with ToPE Model
 # ══════════════════════════════════════════════════════════════════════════════

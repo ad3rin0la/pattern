@@ -55,7 +55,8 @@ Ferreira (2015) "Harmonic Analysis on the Möbius Gyrogroup"
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -1192,3 +1193,247 @@ class CCAttentionPushForwardImproved(nn.Module):
     def extra_repr(self) -> str:
         return (f"d_in={self.d_in}, d_out={self.d_out}, n_heads={self.n_heads}, "
                 f"scale={self.scale:.4f}, d_edge={self.d_edge}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Fermionic CC attention neural operator
+# ══════════════════════════════════════════════════════════════════════════════
+
+def project_to_poincare_ball(x: Tensor, curvature: float = 1.0, eps: float = 1e-5) -> Tensor:
+    """Project vectors into the open Poincare ball of curvature ``curvature``."""
+    if curvature <= 0:
+        raise ValueError("curvature must be positive")
+    max_norm = (1.0 - eps) / math.sqrt(curvature)
+    norm = x.norm(dim=-1, keepdim=True).clamp_min(eps)
+    scale = torch.clamp(max_norm / norm, max=1.0)
+    return x * scale
+
+
+def poincare_log0(x: Tensor, curvature: float = 1.0, eps: float = 1e-7) -> Tensor:
+    """Logarithmic map at the origin for the Poincare ball."""
+    x = project_to_poincare_ball(x, curvature=curvature, eps=eps)
+    sqrt_c = math.sqrt(curvature)
+    norm = x.norm(dim=-1, keepdim=True).clamp_min(eps)
+    return torch.atanh((sqrt_c * norm).clamp(max=1.0 - eps)) * x / (sqrt_c * norm)
+
+
+def poincare_exp0(v: Tensor, curvature: float = 1.0, eps: float = 1e-7) -> Tensor:
+    """Exponential map at the origin for the Poincare ball."""
+    sqrt_c = math.sqrt(curvature)
+    norm = v.norm(dim=-1, keepdim=True).clamp_min(eps)
+    out = torch.tanh(sqrt_c * norm) * v / (sqrt_c * norm)
+    return project_to_poincare_ball(out, curvature=curvature, eps=eps)
+
+
+def mobius_scalar_mul(weight: Tensor, x: Tensor, curvature: float = 1.0) -> Tensor:
+    """Mobius scalar multiplication ``weight odot x`` at the origin."""
+    return poincare_exp0(weight * poincare_log0(x, curvature=curvature), curvature=curvature)
+
+
+def gyrobarycentric_aggregate(
+    values: Tensor,
+    weights: Tensor,
+    index: Tensor,
+    dim_size: int,
+    curvature: float = 1.0,
+) -> Tensor:
+    """Compute ``oplus_i weights_i odot values_i`` per target group."""
+    tangent = poincare_log0(values, curvature=curvature) * weights.unsqueeze(-1)
+    summed = _scatter_add_nd(tangent, index, dim_size)
+    return poincare_exp0(summed, curvature=curvature)
+
+
+def cell_intersection_size(cell_vertex_mask: Tensor, edge_index: Tensor) -> Tensor:
+    """Return ``|x cap y|`` for each directed edge ``x -> y``."""
+    mask = cell_vertex_mask.to(dtype=torch.bool)
+    src, tgt = edge_index[0], edge_index[1]
+    return (mask[src] & mask[tgt]).sum(dim=-1).to(dtype=torch.float32)
+
+
+def exterior_permutation_sign(source_cells: Tensor, target_cells: Tensor) -> Tensor:
+    """Sign of ``source_cell wedge target_cell`` relative to sorted order.
+
+    Inputs are padded integer tensors shaped ``(..., k)`` and ``(..., l)``.
+    Negative entries are treated as padding.  If a vertex appears in both
+    cells, the wedge product contains a duplicate basis vector and the sign is
+    zero.
+    """
+    if source_cells.shape[:-1] != target_cells.shape[:-1]:
+        raise ValueError("source_cells and target_cells must share batch dimensions")
+
+    src_valid = source_cells >= 0
+    tgt_valid = target_cells >= 0
+    duplicates = (
+        (source_cells.unsqueeze(-1) == target_cells.unsqueeze(-2))
+        & src_valid.unsqueeze(-1)
+        & tgt_valid.unsqueeze(-2)
+    ).any(dim=(-1, -2))
+    inversions = (
+        (source_cells.unsqueeze(-1) > target_cells.unsqueeze(-2))
+        & src_valid.unsqueeze(-1)
+        & tgt_valid.unsqueeze(-2)
+    ).sum(dim=(-1, -2))
+    sign = torch.where(inversions.remainder(2) == 0, 1.0, -1.0)
+    sign = sign.to(device=source_cells.device, dtype=torch.float32)
+    return torch.where(duplicates, torch.zeros_like(sign), sign)
+
+
+def wedge_pair(u: Tensor, v: Tensor) -> Tensor:
+    """Antisymmetric rank-2 exterior product ``u wedge v``."""
+    return u.unsqueeze(-1) * v.unsqueeze(-2) - v.unsqueeze(-1) * u.unsqueeze(-2)
+
+
+@dataclass
+class FermionicCCANOConfig:
+    """Configuration for :class:`FermionicCCAttentionNeuralOperator`."""
+
+    d_in: int
+    d_out: int
+    n_heads: int = 4
+    n_ranks: int = 8
+    rank_embed_dim: int = 16
+    dropout: float = 0.0
+    curvature: float = 1.0
+    use_gyro_aggregation: bool = True
+    use_fermionic_sign: bool = True
+    residual: bool = True
+
+
+class FermionicCCAttentionNeuralOperator(nn.Module):
+    """Rank-aware fermionic CC attention operator for tensor fields on cells.
+
+    The layer implements the consolidated math object ``T = (rho, S, P, E,
+    Gamma)`` on a combinatorial complex ``C = (S, X, rk)``.  It accepts one
+    feature vector per cell, arbitrary cell-to-cell relations, rank metadata,
+    and optional vertex membership for the rank/intersection structural bias.
+    """
+
+    def __init__(self, cfg: FermionicCCANOConfig) -> None:
+        super().__init__()
+        if cfg.d_out % cfg.n_heads != 0:
+            raise ValueError("d_out must be divisible by n_heads")
+        if cfg.curvature <= 0:
+            raise ValueError("curvature must be positive")
+
+        self.cfg = cfg
+        self.head_dim = cfg.d_out // cfg.n_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.q_proj = nn.Linear(cfg.d_in, cfg.d_out, bias=False)
+        self.k_proj = nn.Linear(cfg.d_in, cfg.d_out, bias=False)
+        self.v_proj = nn.Linear(cfg.d_in, cfg.d_out, bias=False)
+        self.out_proj = nn.Linear(cfg.d_out, cfg.d_out)
+
+        self.rank_embed = nn.Embedding(cfg.n_ranks, cfg.rank_embed_dim)
+        phi_dim = 2 * cfg.rank_embed_dim + 3
+        self.rank_phi = nn.Sequential(
+            nn.Linear(phi_dim, cfg.rank_embed_dim),
+            nn.SiLU(),
+            nn.Linear(cfg.rank_embed_dim, cfg.n_heads),
+        )
+
+        self.dropout: nn.Module = nn.Dropout(cfg.dropout) if cfg.dropout > 0 else nn.Identity()
+        if cfg.residual and cfg.d_in != cfg.d_out:
+            self.residual_proj: nn.Module = nn.Linear(cfg.d_in, cfg.d_out, bias=False)
+        else:
+            self.residual_proj = nn.Identity()
+
+    def _structural_logits(
+        self,
+        ranks: Tensor,
+        edge_index: Tensor,
+        intersection: Tensor,
+    ) -> Tensor:
+        src, tgt = edge_index[0], edge_index[1]
+        src_rank = ranks[src].clamp(min=0, max=self.cfg.n_ranks - 1)
+        tgt_rank = ranks[tgt].clamp(min=0, max=self.cfg.n_ranks - 1)
+        src_emb = self.rank_embed(src_rank)
+        tgt_emb = self.rank_embed(tgt_rank)
+        rank_gap = (src_rank - tgt_rank).to(dtype=src_emb.dtype).unsqueeze(-1)
+        rank_sum = (src_rank + tgt_rank).to(dtype=src_emb.dtype).unsqueeze(-1)
+        inter = intersection.to(device=src_emb.device, dtype=src_emb.dtype).unsqueeze(-1)
+        phi_in = torch.cat([src_emb, tgt_emb, rank_gap, rank_sum, inter], dim=-1)
+        return self.rank_phi(phi_in)
+
+    def forward(
+        self,
+        cell_features: Tensor,
+        edge_index: Tensor,
+        ranks: Tensor,
+        cell_vertex_mask: Optional[Tensor] = None,
+        ordered_cells: Optional[Tensor] = None,
+        return_attention: bool = False,
+    ) -> Union[Tensor, Dict[str, Tensor]]:
+        n_cells = cell_features.size(0)
+        src, tgt = edge_index[0], edge_index[1]
+        heads = self.cfg.n_heads
+        head_dim = self.head_dim
+
+        q = self.q_proj(cell_features).view(n_cells, heads, head_dim)
+        k = self.k_proj(cell_features).view(n_cells, heads, head_dim)
+        v = self.v_proj(cell_features).view(n_cells, heads, head_dim)
+
+        content_logits = (q[tgt] * k[src]).sum(dim=-1) * self.scale
+        if cell_vertex_mask is None:
+            intersection = cell_features.new_zeros(src.size(0))
+        else:
+            intersection = cell_intersection_size(cell_vertex_mask, edge_index).to(cell_features.device)
+        logits = content_logits + self._structural_logits(ranks, edge_index, intersection)
+
+        attention = _scatter_softmax_2d(logits, tgt, n_cells)
+        attention = self.dropout(attention)
+
+        values = v[src]
+        fermionic_sign = None
+        if self.cfg.use_fermionic_sign and ordered_cells is not None:
+            fermionic_sign = exterior_permutation_sign(ordered_cells[src], ordered_cells[tgt]).to(
+                device=values.device,
+                dtype=values.dtype,
+            )
+            values = values * fermionic_sign.view(-1, 1, 1)
+
+        if self.cfg.use_gyro_aggregation:
+            gyro_values = project_to_poincare_ball(
+                values,
+                curvature=self.cfg.curvature,
+            )
+            gyro_update = gyrobarycentric_aggregate(
+                gyro_values,
+                attention,
+                tgt,
+                n_cells,
+                curvature=self.cfg.curvature,
+            )
+            update = gyro_update.reshape(n_cells, self.cfg.d_out)
+        else:
+            update = _scatter_add_nd(attention.unsqueeze(-1) * values, tgt, n_cells)
+            update = update.reshape(n_cells, self.cfg.d_out)
+
+        dT_dt = self.out_proj(update)
+        if self.cfg.residual:
+            output = self.residual_proj(cell_features) + dT_dt
+        else:
+            output = dT_dt
+
+        if not return_attention:
+            return output
+
+        result = {
+            "output": output,
+            "dT_dt": dT_dt,
+            "attention": attention,
+            "intersection": intersection,
+        }
+        if fermionic_sign is not None:
+            result["fermionic_sign"] = fermionic_sign
+        return result
+
+    def extra_repr(self) -> str:
+        return (
+            f"d_in={self.cfg.d_in}, d_out={self.cfg.d_out}, "
+            f"n_heads={self.cfg.n_heads}, n_ranks={self.cfg.n_ranks}, "
+            f"gyro={self.cfg.use_gyro_aggregation}, fermionic={self.cfg.use_fermionic_sign}"
+        )
+
+
+FermionicCombinatorialComplexAttentionNeuralOperator = FermionicCCAttentionNeuralOperator

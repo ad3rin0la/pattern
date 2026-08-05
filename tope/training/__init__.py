@@ -20,6 +20,12 @@ from tope.training.labels import (
     encode_targets,
     active_tasks_for,
 )
+from tope.training.bidirectional_losses import (
+    BidirectionalLossConfig,
+    BidirectionalPhysicsLoss,
+    masked_gaussian_nll,
+    symmetric_gaussian_kl,
+)
 from tope.training.evaluation import (
     MetricAccumulator,
     FiltrationAttribution,
@@ -40,6 +46,10 @@ __all__ = [
     "ECVocabulary",
     "encode_targets",
     "active_tasks_for",
+    "BidirectionalLossConfig",
+    "BidirectionalPhysicsLoss",
+    "masked_gaussian_nll",
+    "symmetric_gaussian_kl",
     # Evaluation
     "MetricAccumulator",
     "FiltrationAttribution",

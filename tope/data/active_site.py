@@ -15,7 +15,8 @@ trying both label and auth chain IDs for CIF files.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+import warnings
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -122,6 +123,22 @@ class ActiveSite:
             return len(self.atoms)
         return sum(r.n_atoms for r in self.residues)
 
+    @property
+    def elements(self) -> Set[str]:
+        return {a.element for a in self.atoms if a.element}
+
+    @property
+    def has_metal(self) -> bool:
+        metals = {
+            "LI", "BE", "NA", "MG", "AL", "K", "CA", "SC", "TI", "V", "CR",
+            "MN", "FE", "CO", "NI", "CU", "ZN", "GA", "RB", "SR", "Y", "ZR",
+            "NB", "MO", "TC", "RU", "RH", "PD", "AG", "CD", "IN", "SN",
+            "CS", "BA", "LA", "CE", "PR", "ND", "PM", "SM", "EU", "GD",
+            "TB", "DY", "HO", "ER", "TM", "YB", "LU", "HF", "TA", "W", "RE",
+            "OS", "IR", "PT", "AU", "HG", "TL", "PB", "BI",
+        }
+        return any(elem.upper() in metals for elem in self.elements)
+
     def ca_coords_array(self) -> np.ndarray:
         """Return (N_res, 3) Cα coordinate matrix."""
         return np.array([r.ca_coord for r in self.residues])
@@ -170,6 +187,10 @@ class ActiveSite:
             return np.empty((0, 0))
         diff = coords[:, None, :] - coords[None, :, :]
         return np.sqrt((diff ** 2).sum(axis=-1))
+
+    def atom_coords_array(self) -> np.ndarray:
+        """Compatibility alias returning the atom coordinate matrix."""
+        return self.atoms_array().astype(np.float64, copy=False)
 
 
 # ── Extractor ─────────────────────────────────────────────────────────────────
@@ -302,6 +323,14 @@ class ActiveSiteExtractor:
                 atom_records.append(atom)
             if is_cat:
                 cat_ids.add(rec.residue_id)
+            for atom_rec in info.get("atoms", []):
+                atom_records.append(
+                    replace(
+                        atom_rec,
+                        is_catalytic=is_cat,
+                        role=cat_roles.get(key, ""),
+                    )
+                )
 
         site = ActiveSite(
             pdb_id=pdb_id,
@@ -433,7 +462,6 @@ class ActiveSiteExtractor:
 
                 b_factors = [a.get_bfactor() for a in atoms]
                 mean_b = float(np.mean(b_factors)) if b_factors else 0.0
-
                 # Materialise the rank-0 atom cells alongside the residue
                 # summary.  Atom and residue share residue_id, which is the
                 # atom→residue incidence the combinatorial complex is built on.
@@ -501,3 +529,45 @@ class ActiveSiteExtractor:
 
         dist = active_site.distance_matrix()
         return {float(r): (dist <= r).astype(np.int32) for r in radii}
+
+    @staticmethod
+    def compute_atom_distance_matrix(site: ActiveSite) -> np.ndarray:
+        """Compatibility helper for pairwise atom distances."""
+        return site.distance_matrix()
+
+
+# ── Deprecated convenience wrapper ───────────────────────────────────────────
+
+def extract_active_site(
+    pdb_file,
+    catalytic_residues: List,
+    radius: float = 8.0,
+    pdb_id: str = "",
+    ec_number: str = "",
+) -> Optional[ActiveSite]:
+    """Extract an active-site environment using an 8Å radius crop.
+
+    .. deprecated::
+        This function hard-codes a spatial boundary and is incompatible with
+        ToPE's whole-protein thesis.  Use
+        ``tope.topology.build_whole_protein_pcc()`` for all training-pipeline
+        code.  ``extract_active_site`` is retained **only** for visualization
+        and debugging; do not call it from the training pipeline.
+    """
+    warnings.warn(
+        "extract_active_site() is deprecated and must not be used in the "
+        "training pipeline (Phase 2 migration).  "
+        "Use tope.topology.build_whole_protein_pcc() instead, which encodes "
+        "active-site membership as a boolean mask on the full protein.  "
+        "extract_active_site() is retained for visualization / debugging only.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    extractor = ActiveSiteExtractor()
+    return extractor.extract(
+        structure_path=Path(pdb_file),
+        catalytic_residues=catalytic_residues,
+        pdb_id=pdb_id,
+        ec_number=ec_number,
+        radius=radius,
+    )

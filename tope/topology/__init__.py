@@ -55,6 +55,13 @@ from tope.topology.hsh_restriction_maps import (
     verify_addition_theorem,
     run_validation as run_hsh_validation,
 )
+from tope.topology.whole_protein_pcc import (
+    WholeProteinPCC,
+    build_whole_protein_pcc,
+    build_rank_stratified_filtration,
+    construct_sheaf_sections,
+    smoke_test_whole_protein_pcc,
+)
 
 __all__ = [
     # TTN persistent homology
@@ -90,6 +97,12 @@ __all__ = [
     "almost_tangent_score",
     "AlmostTangentDetector",
     "nijenhuis_signal",
+    # Whole-protein PCC (Phase 2 migration)
+    "WholeProteinPCC",
+    "build_whole_protein_pcc",
+    "build_rank_stratified_filtration",
+    "construct_sheaf_sections",
+    "smoke_test_whole_protein_pcc",
     # HSH restriction maps (Phase 2 sheaf upgrade)
     "HSHConfig",
     "HSHSheafLaplacian",

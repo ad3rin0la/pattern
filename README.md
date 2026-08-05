@@ -212,6 +212,32 @@ tope/
 
 ## Key Features
 
+### Bidirectional physics-informed modeling
+
+`BidirectionalPhysicsToPE` implements a probabilistic topology ↔ phenotype model
+for mutation and temperature studies. It provides:
+
+- typed residue/cofactor/ligand/water/subunit graphs with MD/QM edge features;
+- temperature-conditioned global, interface, active-site and pathway pooling;
+- topology and phenotype encoders that infer diagonal-Gaussian latent posteriors;
+- uncertain thermal, catalytic, electronic and topology predictions;
+- Arrhenius kinetics, thermal inactivation and integrated productivity;
+- masked multi-fidelity, physics, KL and cycle-consistency losses.
+
+```python
+from tope.models import BidirectionalPhysicsToPE
+from tope.training import BidirectionalPhysicsLoss
+
+model = BidirectionalPhysicsToPE(topology_target_dim=16)
+forward = model.forward_topology(temperature_dependent_graph)
+inverse = model.infer_topology(phenotype_values, phenotype_mask)
+losses = BidirectionalPhysicsLoss()(forward, targets, inverse)
+```
+
+The inverse decoder predicts distributions over topology descriptors or candidate
+edge changes. It must not be interpreted as uniquely reconstructing a structure
+from catalytic measurements.
+
 ### GPU-Native Persistent Homology (TTN)
 
 Replaces CPU-bound `gudhi` with GPU-accelerated Tensor Tree Networks:

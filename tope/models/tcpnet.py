@@ -447,18 +447,28 @@ class GlobalAttentionPooling(nn.Module):
         self,
         h_nodes: torch.Tensor,
         batch: Optional[torch.Tensor] = None,
+        active_site_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Parameters
         ----------
-        h_nodes : (N_total, H)
-        batch   : (N_total,)  graph membership indices.  If None, single graph.
+        h_nodes          : (N_total, H)
+        batch            : (N_total,)  graph membership indices.  If None, single graph.
+        active_site_mask : (N_total,) bool or float — optional per-atom bias that
+                           up-weights active-site atoms without excluding allosteric
+                           ones.  True / 1.0 atoms receive a +1 logit bonus.
 
         Returns
         -------
         (B, H)
         """
         gate_logits = self.gate(h_nodes).squeeze(-1)  # (N,)
+
+        if active_site_mask is not None:
+            # Additive bias: up-weights catalytic atoms while keeping allosteric
+            # atoms in the pool (they contribute with lower but non-zero weight)
+            bias = active_site_mask.float()
+            gate_logits = gate_logits + bias
 
         if batch is None:
             weights = torch.softmax(gate_logits, dim=0)
@@ -596,8 +606,12 @@ class EnzymeTCPNet(nn.Module):
                 torch.zeros(1, self.face_embed.in_features, device=h_nodes.device)
             )
 
+        # Optional active-site mask (whole-protein migration, Phase 2)
+        # Passed as a per-atom boolean/float tensor from WholeProteinPCC.is_active_site
+        active_site_mask = enzyme_pcc.get("is_active_site")
+
         for layer in self.layers:
             h_nodes, h_edges, h_faces = layer(h_nodes, h_edges, h_faces, B_01, B_12, pos)
 
-        enzyme_embedding = self.pool(h_nodes, batch)
+        enzyme_embedding = self.pool(h_nodes, batch, active_site_mask=active_site_mask)
         return enzyme_embedding, h_nodes

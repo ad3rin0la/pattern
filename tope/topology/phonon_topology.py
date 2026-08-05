@@ -66,6 +66,18 @@ class PhononTopologyConfig:
     sheaf_dim: int = 8  # Ioffe descriptor dimension
 
 
+@dataclass
+class PhononTopologyFeatures:
+    """Container for phonon-topology feature arrays."""
+
+    localization_landscape: np.ndarray
+    vibrational_bins: Optional[np.ndarray] = None
+    filtration_values: Optional[np.ndarray] = None
+    thresholds: Optional[np.ndarray] = None
+    hotspot_indices: List[int] = field(default_factory=list)
+    contacts: Dict[str, List[Tuple[int, int]]] = field(default_factory=dict)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Section 1: Localization Landscape Computation
 # ══════════════════════════════════════════════════════════════════════════════
@@ -139,6 +151,20 @@ def compute_localization_landscape(
     u_h = spsolve(L_h_reg, ones)
 
     return u_h, contacts
+
+
+def identify_thermal_hotspots(
+    u_h: np.ndarray,
+    top_k: int = 20,
+    threshold: Optional[float] = None,
+) -> List[int]:
+    """Return residue/atom indices with high localization landscape values."""
+    if u_h.size == 0:
+        return []
+    if threshold is not None:
+        return np.where(u_h >= threshold)[0].astype(int).tolist()
+    k = min(top_k, u_h.size)
+    return np.argsort(u_h)[-k:][::-1].astype(int).tolist()
 
 
 def compute_cofactor_contacts(
@@ -437,6 +463,9 @@ class SheafENM(HodgeLaplacianENM):
         sheaf_dim: int = 8,
         config: Optional[PhononTopologyConfig] = None,
         descriptor_metric: Optional[np.ndarray] = None,
+        tls_groups: Optional[List[Any]] = None,
+        atom_coords: Optional[np.ndarray] = None,
+        atom_to_group: Optional[Dict[int, int]] = None,
         use_hsh: bool = False,
         hsh_config: Optional["Any"] = None,
     ):
@@ -450,6 +479,11 @@ class SheafENM(HodgeLaplacianENM):
         self.descriptor_metric: np.ndarray = (
             descriptor_metric if descriptor_metric is not None else np.eye(sheaf_dim)
         )
+        # TLS Hirshfeld constraint: for intra-subunit bonds, restrict to plane ⊥ bond.
+        # Reduces restriction map storage from 64 floats (8×8) to 3 floats (n_hat).
+        self.tls_groups: Optional[List[Any]] = tls_groups
+        self.atom_coords: Optional[np.ndarray] = atom_coords
+        self.atom_to_group: Optional[Dict[int, int]] = atom_to_group or {}
 
         # Phase-2 HSH restriction maps (Avery 1994).  When enabled, the rank-1
         # Cerrini outer product is replaced by an HSH expansion in the 36-element
@@ -509,7 +543,35 @@ class SheafENM(HodgeLaplacianENM):
                 s_i = sheaf_sections[i]
                 s_j = sheaf_sections[j]
 
-                if self.use_hsh and self._hsh is not None:
+                # Check if bond is intra-TLS-group (Hirshfeld rigid-bond constraint).
+                # For intra-subunit bonds: restriction map = projection onto plane ⊥ bond.
+                # Storage: 3 floats (n_hat) instead of 64 (8×8 matrix).
+                # Reference: Hirshfeld 1976 — (U_i - U_j)·n̂·n̂^T = 0 constraint.
+                use_hirshfeld = (
+                    self.tls_groups is not None
+                    and self.atom_coords is not None
+                    and i < len(self.atom_coords)
+                    and j < len(self.atom_coords)
+                    and self.atom_to_group.get(i, -1) == self.atom_to_group.get(j, -2)
+                    and self.atom_to_group.get(i, -1) >= 0
+                )
+
+                if use_hirshfeld:
+                    # Hirshfeld: R_ij = I - n̂⊗n̂ (projection onto plane ⊥ to bond)
+                    # Embedded in the (d×d) stalk space via Cerrini block structure:
+                    # spatial ADP block (first 3 dims), remaining dims use identity.
+                    bond_vec = self.atom_coords[j] - self.atom_coords[i]
+                    bond_norm = np.linalg.norm(bond_vec)
+                    if bond_norm > 1e-7:
+                        n_hat = bond_vec / bond_norm
+                    else:
+                        n_hat = np.array([1.0, 0.0, 0.0])
+                    # 3×3 Hirshfeld projection
+                    R_spatial = np.eye(3) - np.outer(n_hat, n_hat)
+                    # Embed in d×d: spatial block (0:3), identity elsewhere
+                    R_ij = np.eye(d)
+                    R_ij[:3, :3] = R_spatial
+                elif self.use_hsh and self._hsh is not None:
                     # Phase-2 HSH expansion (Avery 1994): replaces the rank-1
                     # outer product with a 36-element basis of Sym(R^d).
                     R_ij = self._hsh.restriction_map(s_i, s_j)

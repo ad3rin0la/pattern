@@ -1,32 +1,31 @@
 """
-ToPE Model — Full Topological Pattern Recognition Model
-=========================================================
+ToPE Model
+==========
 
-Two model variants:
+**Training model (Phase 2+):**
 
-**ToPEModel** (original):
-    Active-site encoder (EnzymeTCPNet) + substrate/product cross-attention
-    + multi-task heads.  Operates on 8 Å active-site Enzyme-PCC.
+    CompleteToPEModel — whole-protein encoder (WholeProteinTCPNet) with the
+    full multi-scale protein graph, is_active_site attention bias, and
+    enhanced task heads.  This is the *only* model used in the training
+    pipeline from Phase 2 onward.
 
-**CompleteToPEModel** (updated):
-    Whole-protein encoder (WholeProteinTCPNet) + enhanced task heads
-    (including residue-level kinetics attention and distant mutation
-    effect prediction).  Operates on the full multi-scale protein graph.
+**Baseline / ablation reference (deprecated):**
+
+    ToPEModel — 8 Å active-site crop variant.  Retained *only* as an
+    ablation baseline for Phase 2 F-score comparisons.  It raises a
+    DeprecationWarning on instantiation and must not appear in any training
+    script or production inference path.
 
 Usage
 -----
-    from tope.models import ToPEModel, ToPEConfig
     from tope.models import CompleteToPEModel, CompleteToPEConfig
 
-    # Active-site only
-    model = ToPEModel(ToPEConfig())
-
-    # Whole-protein
     model = CompleteToPEModel(CompleteToPEConfig())
 """
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -130,6 +129,14 @@ class ToPEModel(nn.Module):
     """
 
     def __init__(self, cfg: Optional[ToPEConfig] = None):
+        warnings.warn(
+            "ToPEModel (8Å active-site crop) is deprecated. "
+            "Use CompleteToPEModel, which operates on the full protein via "
+            "WholeProteinPCC and is the sole training model as of Phase 2. "
+            "ToPEModel is retained only as a baseline for ablations.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         super().__init__()
         self.cfg = cfg or ToPEConfig()
 

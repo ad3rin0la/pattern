@@ -3,19 +3,30 @@ ToPE Models
 ===========
 Neural network architectures for enzyme function prediction.
 
-Includes:
+Training model (Phase 2+):
+    - CompleteToPEModel: whole-protein encoder, sole training model
+
+Ablation baseline (deprecated, not for training):
+    - ToPEModel: 8 Å active-site crop — Phase 2 ablation reference only
+
+Other components:
     - TCPNet: Topology-Complete Perceptron Network message passing
-    - ToPEModel: Active-site and whole-protein model variants
     - Multi-subunit: Quaternary structure with cooperativity prediction
     - p-Laplacian: Learnable nonlinear diffusion for mechanistic analysis
     - Memory-optimized: TTN + gradient checkpointing for consumer GPUs
 """
 
+# ── Training model ────────────────────────────────────────────────────────────
+from tope.models.tope_model import (
+    CompleteToPEModel,
+    CompleteToPEConfig,
+)
+
+# ── Ablation baseline (deprecated — Phase 2 F-score reference only) ──────────
+# Do NOT import ToPEModel/ToPEConfig in training scripts or inference paths.
 from tope.models.tope_model import (
     ToPEModel,
     ToPEConfig,
-    CompleteToPEModel,
-    CompleteToPEConfig,
 )
 from tope.models.tcpnet import (
     TCPNetConfig,
@@ -112,6 +123,13 @@ from tope.models.cc_attention import (
     CCAttentionBlock,
     AttentionMergeNode,
     build_zone_adjacency,
+    FermionicCCANOConfig,
+    FermionicCCAttentionNeuralOperator,
+    FermionicCombinatorialComplexAttentionNeuralOperator,
+    cell_intersection_size,
+    exterior_permutation_sign,
+    gyrobarycentric_aggregate,
+    wedge_pair,
 )
 from tope.models.tope_residual import (
     IntraRankResidualBlock,
@@ -119,13 +137,43 @@ from tope.models.tope_residual import (
     SpectralResidualTTN,
     ToPERankStack,
 )
+from tope.models.bidirectional_physics import (
+    BidirectionalPhysicsConfig,
+    BidirectionalPhysicsToPE,
+    DiagonalGaussian,
+    MechanisticHeads,
+    NODE_TYPES,
+    EDGE_TYPES,
+    PHENOTYPE_FIELDS,
+    PhenotypeEncoder,
+    PhysicsIntegrator,
+    TemperatureEncoding,
+    TopologyDecoder,
+    TypedTopologyEncoder,
+    mutation_epistasis,
+)
 
 __all__ = [
-    # Core models
-    "ToPEModel",
-    "ToPEConfig",
+    # Bidirectional physics-informed latent model
+    "BidirectionalPhysicsConfig",
+    "BidirectionalPhysicsToPE",
+    "DiagonalGaussian",
+    "MechanisticHeads",
+    "NODE_TYPES",
+    "EDGE_TYPES",
+    "PHENOTYPE_FIELDS",
+    "PhenotypeEncoder",
+    "PhysicsIntegrator",
+    "TemperatureEncoding",
+    "TopologyDecoder",
+    "TypedTopologyEncoder",
+    "mutation_epistasis",
+    # Training model (Phase 2+)
     "CompleteToPEModel",
     "CompleteToPEConfig",
+    # Ablation baseline — deprecated, not for training
+    "ToPEModel",
+    "ToPEConfig",
     # TCPNet
     "TCPNetConfig",
     "GaussianRBF",
@@ -199,6 +247,13 @@ __all__ = [
     "CCAttentionBlock",
     "AttentionMergeNode",
     "build_zone_adjacency",
+    "FermionicCCANOConfig",
+    "FermionicCCAttentionNeuralOperator",
+    "FermionicCombinatorialComplexAttentionNeuralOperator",
+    "cell_intersection_size",
+    "exterior_permutation_sign",
+    "gyrobarycentric_aggregate",
+    "wedge_pair",
     # Deep residual learning
     "IntraRankResidualBlock",
     "InterRankResidualMergeNode",
