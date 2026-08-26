@@ -275,6 +275,7 @@ class EnhancedMultiTaskLoss(nn.Module):
         n_ec_levels: int = 4,
         hierarchy_weight: float = 0.1,
         label_smoothing: float = 0.05,
+        domain_discovery_weight: float = 1.0,
     ):
         super().__init__()
 
@@ -288,6 +289,7 @@ class EnhancedMultiTaskLoss(nn.Module):
 
         self.hierarchy_loss = ECHierarchyConsistencyLoss(hierarchy_weight)
         self.label_smoothing = label_smoothing
+        self.domain_discovery_weight = domain_discovery_weight
 
     def _ec_loss(
         self,
@@ -331,6 +333,7 @@ class EnhancedMultiTaskLoss(nn.Module):
             active_tasks = {
                 "ec": True, "selectivity": True, "kcat": True,
                 "km": True, "mutation": True, "residue_importance": True,
+                "domain_discovery": True,
             }
 
         loss_dict: Dict[str, torch.Tensor] = {}
@@ -437,6 +440,18 @@ class EnhancedMultiTaskLoss(nn.Module):
             loss_dict["residue_importance"] = l_imp.detach()
         else:
             loss_dict["residue_importance"] = torch.tensor(0.0, device=device)
+
+        # Label-free latent-domain objectives are produced by the model itself.
+        domain_losses = predictions.get("domain_losses")
+        if active_tasks.get("domain_discovery", True) and domain_losses is not None:
+            l_domain = domain_losses["total"]
+            total = total + self.domain_discovery_weight * l_domain
+            loss_dict["domain_discovery"] = l_domain.detach()
+            for name, value in domain_losses.items():
+                if name != "total":
+                    loss_dict[f"domain_{name}"] = value.detach()
+        else:
+            loss_dict["domain_discovery"] = torch.tensor(0.0, device=device)
 
         loss_dict["total"] = total
         loss_dict["weights"] = {

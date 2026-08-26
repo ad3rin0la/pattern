@@ -292,14 +292,15 @@ class EnhancedKineticEfficiencyHead(nn.Module):
         )
 
         # Combined predictors
-        self.kcat_combiner = nn.Linear(H + 1, 1)
-        self.km_combiner = nn.Linear(H + 1, 1)
+        self.kcat_combiner = nn.Linear(2 * H + 1, 1)
+        self.km_combiner = nn.Linear(2 * H + 1, 1)
 
     def forward(
         self,
         enzyme_embedding: torch.Tensor,
         h_residues: torch.Tensor,
         zone_assignments: torch.Tensor,
+        h_sub_attended: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Parameters
@@ -325,12 +326,19 @@ class EnhancedKineticEfficiencyHead(nn.Module):
         # Weighted residue features
         residue_contribution = (attn_weights.unsqueeze(-1) * h_residues).sum(dim=1)  # (B, H)
 
-        # Combine global + residue-level
+        # Substrate context is required for specificity. The fallback preserves
+        # compatibility for enzyme-only pretraining without claiming that those
+        # predictions are substrate-specific.
+        substrate_context = (
+            h_sub_attended if h_sub_attended is not None else enzyme_embedding
+        )
+
+        # Combine global, residue-level, and substrate-attended context.
         log_kcat = self.kcat_combiner(
-            torch.cat([residue_contribution, log_kcat_global], dim=-1)
+            torch.cat([residue_contribution, substrate_context, log_kcat_global], dim=-1)
         )
         log_km = self.km_combiner(
-            torch.cat([residue_contribution, log_km_global], dim=-1)
+            torch.cat([residue_contribution, substrate_context, log_km_global], dim=-1)
         )
 
         log_efficiency = log_kcat - log_km
@@ -501,7 +509,7 @@ class WholeProteinTaskHeads(nn.Module):
         # Enhanced kinetics (requires per-residue embeddings)
         if h_residues is not None and zone_assignments is not None:
             log_kcat, log_km, log_eff, kin_attn = self.kinetics_head(
-                enzyme_embedding, h_residues, zone_assignments
+                enzyme_embedding, h_residues, zone_assignments, h_sub_attended
             )
             outputs["log_kcat"] = log_kcat
             outputs["log_km"] = log_km

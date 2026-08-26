@@ -126,7 +126,8 @@ class ToPEDataset(Dataset):
     split : optional filter ("train"/"val"/"test") applied to the records.
     with_molecules : also emit ``substrate``/``product`` graphs (featurised from
         the persisted SMILES) so the cross-attention + kinetics/selectivity
-        heads have inputs.  Missing/invalid SMILES degrade to a dummy atom.
+        heads have inputs. Missing SMILES use a placeholder; invalid non-empty
+        SMILES raise during loading.
     mol_featurizer : molecule featuriser (defaults to MoleculeFeaturizer).
     """
 
@@ -215,11 +216,12 @@ class ToPEDataset(Dataset):
 
     def _mol_graph(self, smiles: str) -> Dict[str, "torch.Tensor"]:
         """Featurise a SMILES string into a substrate/product graph dict."""
-        feats, edge_index = smiles_to_graph(smiles, self.mol_featurizer)
+        feats, edge_index, edge_features = smiles_to_graph(smiles, self.mol_featurizer)
         m = feats.shape[0]
         return {
             "node_features": torch.tensor(feats, dtype=torch.float32),
             "edge_index": torch.tensor(edge_index, dtype=torch.long),
+            "edge_features": torch.tensor(edge_features, dtype=torch.float32),
             "batch": torch.zeros(m, dtype=torch.long),
         }
 
@@ -244,6 +246,8 @@ def _labels_from_record(r: Dict[str, Any]) -> Dict[str, Any]:
         "ec_number": r.get("ec_number", ""),
         "ec_top_level": r.get("ec_top_level", ""),
         "kinetics": [_f(r.get("log_kcat")), _f(r.get("log_km")), _f(r.get("log_kcat_km"))],
+        "detected": r.get("detected"),
+        "detection_limit_log": _f(r.get("detection_limit_log")),
     }
 
 
@@ -268,7 +272,7 @@ def collate_enzyme_pcc(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     node_feats, poss, edge_feats = [], [], []
     edge_indices, atom_residues, batch_vec = [], [], []
-    pdb_ids, kinetics, ec_numbers, ec_tops = [], [], [], []
+    pdb_ids, kinetics, detections, detection_limits, ec_numbers, ec_tops = [], [], [], [], [], []
 
     node_offset = 0
     res_offset = 0
@@ -293,6 +297,8 @@ def collate_enzyme_pcc(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         lab = s.get("labels", {})
         pdb_ids.append(s.get("pdb_id", ""))
         kinetics.append(lab.get("kinetics", [float("nan")] * 3))
+        detections.append(lab.get("detected"))
+        detection_limits.append(lab.get("detection_limit_log", float("nan")))
         ec_numbers.append(lab.get("ec_number", ""))
         ec_tops.append(lab.get("ec_top_level", ""))
 
@@ -312,6 +318,8 @@ def collate_enzyme_pcc(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
             "ec_number": ec_numbers,
             "ec_top_level": ec_tops,
             "kinetics": torch.tensor(kinetics, dtype=torch.float32),
+            "detected": detections,
+            "detection_limit_log": torch.tensor(detection_limits, dtype=torch.float32),
         },
     }
     # Substrate / product molecule graphs (present iff the dataset emitted them).
@@ -323,16 +331,18 @@ def collate_enzyme_pcc(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def _collate_mol_graphs(graphs: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Disjoint-union batching for substrate/product molecule graphs."""
-    node_feats, edge_indices, batch_vec = [], [], []
+    node_feats, edge_indices, edge_features, batch_vec = [], [], [], []
     offset = 0
     for g, graph in enumerate(graphs):
         m = graph["node_features"].size(0)
         node_feats.append(graph["node_features"])
         edge_indices.append(graph["edge_index"] + offset)
+        edge_features.append(graph["edge_features"])
         batch_vec.append(torch.full((m,), g, dtype=torch.long))
         offset += m
     return {
         "node_features": torch.cat(node_feats, dim=0),
         "edge_index": torch.cat(edge_indices, dim=1) if edge_indices else torch.zeros(2, 0, dtype=torch.long),
+        "edge_features": torch.cat(edge_features, dim=0),
         "batch": torch.cat(batch_vec, dim=0),
     }

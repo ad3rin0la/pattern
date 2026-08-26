@@ -24,12 +24,18 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+
+_AMINO_ACIDS = (
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+)
+_AMINO_ACID_INDEX = {name: i for i, name in enumerate(_AMINO_ACIDS)}
 
 # Optional BioPython
 try:
@@ -373,6 +379,7 @@ class MultiScaleProteinGraph:
         catalytic_residues: List[Tuple[str, int]],
         cfg: Optional[MultiScaleGraphConfig] = None,
         spectral_features: Optional[Dict] = None,
+        domain_annotations: Optional[Sequence[Any]] = None,
     ):
         if not HAS_BIOPYTHON:
             raise ImportError("BioPython is required for MultiScaleProteinGraph")
@@ -381,6 +388,7 @@ class MultiScaleProteinGraph:
         self.catalytic_residues = catalytic_residues
         self.cfg = cfg or MultiScaleGraphConfig()
         self.spectral_features = spectral_features
+        self.domain_annotations = list(domain_annotations or [])
 
         parser = PDBParser(QUIET=True)
         self.structure = parser.get_structure("enzyme", pdb_file)
@@ -463,6 +471,22 @@ class MultiScaleProteinGraph:
             [1.0 if rid in catalytic_set else 0.0 for rid in all_residues],
             dtype=torch.float32,
         )
+        residue_domain, domains, domain_architecture = self._domain_cells(all_residues)
+        chain_vocab = {chain: i for i, chain in enumerate(dict.fromkeys(
+            chain for chain, _ in all_residues
+        ))}
+        chain_index = torch.tensor(
+            [chain_vocab[chain] for chain, _ in all_residues], dtype=torch.long
+        )
+        sequence_index = torch.tensor(
+            [residue_number for _, residue_number in all_residues], dtype=torch.long
+        )
+        # Default sequence modality: residue-identity one-hot from the structure.
+        # Callers may replace this tensor with pretrained sequence embeddings.
+        sequence_features = torch.zeros((len(all_residues), 21), dtype=torch.float32)
+        for i, (chain_id, residue_number) in enumerate(all_residues):
+            residue_name = model[chain_id][residue_number].resname
+            sequence_features[i, _AMINO_ACID_INDEX.get(residue_name, 20)] = 1.0
 
         return {
             "num_nodes": len(all_residues),
@@ -474,7 +498,51 @@ class MultiScaleProteinGraph:
             "residue_ids": all_residues,
             "catalytic_residues": self.catalytic_residues,
             "catalytic_mask": catalytic_mask,
+            "residue_domain": residue_domain,
+            "domains": domains,
+            "domain_architecture": domain_architecture,
+            "chain_index": chain_index,
+            "sequence_index": sequence_index,
+            "sequence_features": sequence_features,
         }
+
+    def _domain_cells(
+        self, residue_ids: List[Tuple[str, int]],
+    ) -> Tuple[torch.Tensor, List[Dict[str, Any]], Dict[str, List[int]]]:
+        """Materialise ordered domain cells and residue→domain incidence."""
+        membership = torch.full((len(residue_ids),), -1, dtype=torch.long)
+        domains: List[Dict[str, Any]] = []
+        architecture: Dict[str, List[int]] = {}
+        previous_end: Dict[str, int] = {}
+        ordered = sorted(
+            self.domain_annotations,
+            key=lambda d: (d.chain_id, d.start, d.end, d.family),
+        )
+        for annotation in ordered:
+            if annotation.start > annotation.end:
+                raise ValueError(f"invalid domain interval: {annotation}")
+            if annotation.chain_id in previous_end and annotation.start <= previous_end[annotation.chain_id]:
+                raise ValueError(f"overlapping domains on chain {annotation.chain_id}")
+            previous_end[annotation.chain_id] = annotation.end
+            member_indices = [
+                i for i, (chain, residue_number) in enumerate(residue_ids)
+                if chain == annotation.chain_id
+                and annotation.start <= residue_number <= annotation.end
+            ]
+            if not member_indices:
+                raise ValueError(f"domain {annotation.family} contains no graph residues")
+            domain_idx = len(domains)
+            membership[member_indices] = domain_idx
+            domains.append({
+                "domain_id": annotation.domain_id or f"{annotation.family}:{domain_idx + 1}",
+                "family": annotation.family,
+                "chain_id": annotation.chain_id,
+                "start": annotation.start,
+                "end": annotation.end,
+                "residue_indices": member_indices,
+            })
+            architecture.setdefault(annotation.chain_id, []).append(domain_idx)
+        return membership, domains, architecture
 
     @staticmethod
     def _residue_center(model: Any, rid: Tuple[str, int]) -> torch.Tensor:

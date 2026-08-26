@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -39,6 +39,17 @@ except ImportError:
 
 
 # ── Dataclass ─────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class DomainAnnotation:
+    """One ordered domain-family interval on a protein chain."""
+
+    chain_id: str
+    start: int
+    end: int
+    family: str
+    domain_id: str = ""
+
 
 @dataclass
 class WholeProteinPCC:
@@ -74,8 +85,16 @@ class WholeProteinPCC:
     # Rank-2 cells (residues)
     residue_groups: Dict[tuple, List[int]]
 
-    # Rank-3 cells (chains)
+    # Rank-3 cells (domains), ordered within each chain
+    domain_groups: Dict[tuple, List[tuple]]
+    domain_families: Dict[tuple, str]
+    domain_architecture: Dict[str, List[tuple]]
+
+    # Rank-4 cells (chains)
     chain_groups:   Dict[str, List[tuple]]
+
+    # Rank-5 cell (the assembled complex)
+    complex_groups: Dict[str, List[str]]
 
     # Metadata
     pdb_id:     str
@@ -90,6 +109,7 @@ def build_whole_protein_pcc(
     pdb_file: str,
     catalytic_residues: List[tuple],
     include_hydrogens: bool = False,
+    domain_annotations: Optional[Sequence[DomainAnnotation]] = None,
 ) -> WholeProteinPCC:
     """Build a whole-protein Combinatorial Complex from a PDB/CIF file.
 
@@ -182,6 +202,10 @@ def build_whole_protein_pcc(
     coords_arr         = np.array(coords, dtype=np.float32)
     is_active_site_arr = np.array(is_active_site, dtype=bool)
 
+    domain_groups, domain_families, domain_architecture = _build_domain_cells(
+        residue_groups, domain_annotations or []
+    )
+
     return WholeProteinPCC(
         atoms=atoms,
         coords=coords_arr,
@@ -189,12 +213,53 @@ def build_whole_protein_pcc(
         residue_ids=residue_ids,
         is_active_site=is_active_site_arr,
         residue_groups=residue_groups,
+        domain_groups=domain_groups,
+        domain_families=domain_families,
+        domain_architecture=domain_architecture,
         chain_groups=chain_groups,
+        complex_groups={pdb_file_str: list(chain_groups)},
         pdb_id=pdb_file_str,
         n_atoms=len(atoms),
         n_residues=len(residue_groups),
         n_chains=len(chain_groups),
     )
+
+
+def _build_domain_cells(
+    residue_groups: Dict[tuple, List[int]],
+    annotations: Sequence[DomainAnnotation],
+) -> Tuple[Dict[tuple, List[tuple]], Dict[tuple, str], Dict[str, List[tuple]]]:
+    """Build residue→domain→chain incidence without inferring fake domains."""
+    groups: Dict[tuple, List[tuple]] = {}
+    families: Dict[tuple, str] = {}
+    architecture: Dict[str, List[tuple]] = {}
+    by_chain: Dict[str, List[DomainAnnotation]] = {}
+    for annotation in annotations:
+        if annotation.start > annotation.end:
+            raise ValueError(f"invalid domain interval: {annotation}")
+        by_chain.setdefault(annotation.chain_id, []).append(annotation)
+
+    for chain_id, chain_annotations in by_chain.items():
+        previous_end: Optional[int] = None
+        for ordinal, annotation in enumerate(
+            sorted(chain_annotations, key=lambda d: (d.start, d.end, d.family))
+        ):
+            if previous_end is not None and annotation.start <= previous_end:
+                raise ValueError(f"overlapping domains on chain {chain_id}")
+            previous_end = annotation.end
+            domain_name = annotation.domain_id or f"{annotation.family}:{ordinal + 1}"
+            key = (chain_id, domain_name)
+            members = [
+                residue_key for residue_key in residue_groups
+                if residue_key[0] == chain_id
+                and annotation.start <= int(residue_key[1][1]) <= annotation.end
+            ]
+            if not members:
+                raise ValueError(f"domain {key} contains no structure residues")
+            groups[key] = members
+            families[key] = annotation.family
+            architecture.setdefault(chain_id, []).append(key)
+    return groups, families, architecture
 
 
 # ── Filtration ────────────────────────────────────────────────────────────────

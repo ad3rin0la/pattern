@@ -46,6 +46,7 @@ _mol = importlib.import_module("tope.data.molecule")
 _active_site = importlib.import_module("tope.data.active_site")
 _features = importlib.import_module("tope.data.features")
 _dataset = importlib.import_module("tope.data.dataset")
+_kinetics = importlib.import_module("tope.data.kinetics_client")
 _loader = importlib.import_module("tope.data.loader")
 _config = importlib.import_module("tope.data.config")
 _labels = importlib.import_module("tope.training.labels")
@@ -76,18 +77,32 @@ def test_parse_smiles_connectivity(smiles, n_atoms, n_bonds):
 
 
 def test_smiles_to_graph_shapes_and_undirected():
-    feats, ei = _mol.smiles_to_graph("CC(=O)O")
+    feats, ei, ef = _mol.smiles_to_graph("CC(=O)O")
     assert feats.shape == (4, _mol.MOL_FEAT_DIM)
     assert ei.shape == (2, 6)                       # 3 bonds × 2 directions
+    assert ef.shape == (6, _mol.MOL_EDGE_FEAT_DIM)
+    assert int((ef[:, 1] == 1).sum()) == 2          # double bond, both directions
     # Undirected: the reverse of every edge is present.
     edges = {tuple(c) for c in ei.T.tolist()}
     assert all((j, i) in edges for i, j in edges)
 
 
-def test_invalid_smiles_degrades_to_dummy():
-    feats, ei = _mol.smiles_to_graph("not-a-molecule @@@")
+def test_invalid_smiles_raises_and_missing_is_explicit_placeholder():
+    with pytest.raises(ValueError):
+        _mol.smiles_to_graph("not-a-molecule @@@")
+    feats, ei, ef = _mol.smiles_to_graph("")
     assert feats.shape == (1, _mol.MOL_FEAT_DIM)
     assert ei.shape == (2, 0)
+    assert ef.shape == (0, _mol.MOL_EDGE_FEAT_DIM)
+
+
+def test_stereochemistry_is_retained():
+    left, _, left_edges = _mol.smiles_to_graph("F/C=C/F")
+    right, _, right_edges = _mol.smiles_to_graph("F/C=C\\F")
+    assert left.shape == right.shape
+    assert not np.array_equal(left_edges, right_edges)
+    chiral, _, _ = _mol.smiles_to_graph("N[C@H](C)C(=O)O")
+    assert chiral[:, -2:].sum() == 1
 
 
 # ── Loader: molecule emission + collation ─────────────────────────────────────
@@ -135,6 +150,29 @@ def test_dataset_persists_smiles(tmp_path):
     assert by_id["PDB1"]["product_smiles"] == ""
 
 
+def test_dataset_expands_one_structure_to_substrate_observations(tmp_path):
+    site = _make_site("PDB0", "3.4.21.1", 0)
+    feats = _features.FeatureComputer(compute_sasa=False, normalise=False).compute(site)
+    k1 = _kinetics.ObservationKey("PDB0", "ethanol", "acetaldehyde", 30.0, 7.0)
+    k2 = _kinetics.ObservationKey("PDB0", "propanol", "propanal", 30.0, 7.0)
+    builder = _dataset.DatasetBuilder(
+        output_dir=tmp_path / "processed", features_dir=tmp_path / "features",
+        config=_config.PipelineConfig(output_format="json"),
+    )
+    records = builder.build(
+        [site], [feats], split_ratios=(1.0, 0.0, 0.0),
+        kinetics_map={k1: {"kcat/Km": 2.0}, k2: {"kcat/Km": -1.0}},
+        molecule_map={
+            k1: {"substrate": "CCO", "product": "CC=O"},
+            k2: {"substrate": "CCCO", "product": "CCC=O"},
+        },
+    )
+    assert len(records) == 2
+    assert {r.substrate_id for r in records} == {"ethanol", "propanol"}
+    assert records[0].coords_path == records[1].coords_path
+    assert {r.log_kcat_km for r in records} == {2.0, -1.0}
+
+
 def test_loader_emits_and_collates_molecule_graphs(tmp_path):
     index, fdir = _build(tmp_path)
     ds = _loader.ToPEDataset.from_index(index, fdir, edge_radius=6.0, edge_feat_dim=4,
@@ -143,6 +181,7 @@ def test_loader_emits_and_collates_molecule_graphs(tmp_path):
     item = ds[0]
     assert item["substrate"]["node_features"].shape == (3, _mol.MOL_FEAT_DIM)  # CCO
     assert item["product"]["node_features"].shape[0] == 3                       # CC=O
+    assert item["product"]["edge_features"].shape[1] == _mol.MOL_EDGE_FEAT_DIM
 
     batch = _loader.collate_enzyme_pcc([ds[0], ds[1]])
     sub = batch["substrate"]
@@ -176,7 +215,8 @@ def test_full_model_step_with_kinetics_head(tmp_path):
         head_hidden_dim=16, use_cross_attention=True, use_e3nn=False,
         mol_feat_dim=ds.mol_feat_dim, mol_hidden_dim=16, mol_n_layers=2,
     )
-    model = _tope_model.ToPEModel(cfg)
+    with pytest.warns(DeprecationWarning, match="active-site crop"):
+        model = _tope_model.ToPEModel(cfg)
     loss_fn = _losses.MultiTaskLoss()
     opt = torch.optim.Adam(list(model.parameters()) + list(loss_fn.parameters()), lr=1e-3)
 
@@ -185,6 +225,8 @@ def test_full_model_step_with_kinetics_head(tmp_path):
     # Cross-attention ran → kinetics head produced predictions.
     assert predictions["kinetics"] is not None
     assert predictions["kinetics"].shape == (2, 3)
+    assert "h_substrate_attended" in predictions["attn_maps"]
+    assert "h_product_attended" in predictions["attn_maps"]
 
     targets = _labels.encode_targets(batch["labels"], vocab)
     active = _labels.active_tasks_for(targets)

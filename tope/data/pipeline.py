@@ -45,6 +45,7 @@ from tope.data.kinetics_client import (
     KineticsAggregator,
     KineticEntry,
     KineticsSummary,
+    ObservationKey,
 )
 from tope.data.mcsa_client import MCSAClient, MCSAEntry
 from tope.data.pdb_client import PDBClient
@@ -194,8 +195,8 @@ class CurationPipeline:
 
     def _step_fetch_kinetics(
         self, mcsa_entries: List[MCSAEntry]
-    ) -> Dict[str, Dict[str, float]]:
-        """Step 2: Fetch kinetic parameters and build PDB→kinetics map."""
+    ) -> Dict[ObservationKey, Dict[str, Any]]:
+        """Step 2: build substrate/condition-preserving PDB observations."""
         if not self.config.fetch_kinetics:
             logger.info("Kinetics fetching disabled — skipping")
             return {}
@@ -230,22 +231,36 @@ class CurationPipeline:
             summary.unique_ec_numbers,
         )
 
-        # For samples without direct PDB kinetics, fall back to EC-level medians
-        # Build a combined map: PDB-level takes priority, then EC-level
-        combined: Dict[str, Dict[str, float]] = {}
+        # Re-key EC-level assays to each compatible structure without collapsing
+        # their substrate or assay conditions. Direct PDB observations override
+        # only an exactly matching observation key.
+        combined: Dict[ObservationKey, Dict[str, Any]] = {}
 
         # First populate from EC map (keyed by PDB ID via M-CSA entries)
         for entry in mcsa_entries:
-            if entry.pdb_id and entry.ec_number in ec_map:
-                combined.setdefault(entry.pdb_id, {}).update(ec_map[entry.ec_number])
+            if not entry.pdb_id:
+                continue
+            for key, params in ec_map.items():
+                if key.enzyme_id == entry.ec_number.upper():
+                    pdb_key = ObservationKey(
+                        enzyme_id=entry.pdb_id.upper(),
+                        substrate_id=key.substrate_id,
+                        product_id=key.product_id,
+                        temperature=key.temperature,
+                        ph=key.ph,
+                        ionic_conditions=key.ionic_conditions,
+                        mutation=key.mutation,
+                    )
+                    combined.setdefault(pdb_key, {}).update(params)
 
         # Then override with PDB-specific data where available
-        for pdb_id, params in pdb_map.items():
-            combined.setdefault(pdb_id, {}).update(params)
+        for key, params in pdb_map.items():
+            combined.setdefault(key, {}).update(params)
 
         logger.info(
             "Kinetics coverage: %d / %d PDB IDs have kinetic labels",
-            len(combined), len({e.pdb_id for e in mcsa_entries}),
+            len({key.enzyme_id for key in combined}),
+            len({e.pdb_id for e in mcsa_entries}),
         )
 
         return combined

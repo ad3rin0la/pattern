@@ -64,6 +64,13 @@ class KineticEntry:
     source_id: str = ""         # database-specific identifier
     is_mutant: bool = False     # wild-type vs mutant
     comment: str = ""
+    product: str = ""
+    substrate_id: str = ""
+    product_id: str = ""
+    ionic_conditions: str = ""
+    mutation: str = ""
+    detected: Optional[bool] = None
+    detection_limit: Optional[float] = None
 
     def __post_init__(self):
         if self.value > 0:
@@ -72,6 +79,34 @@ class KineticEntry:
     @property
     def has_pdb(self) -> bool:
         return bool(self.pdb_id) and len(self.pdb_id) == 4
+
+
+@dataclass(frozen=True)
+class ObservationKey:
+    """Canonical enzyme-assay identity used for aggregation and training rows."""
+
+    enzyme_id: str
+    substrate_id: str
+    product_id: str = ""
+    temperature: Optional[float] = None
+    ph: Optional[float] = None
+    ionic_conditions: str = ""
+    mutation: str = ""
+
+
+def _observation_key(entry: KineticEntry, enzyme_id: str) -> ObservationKey:
+    substrate = (entry.substrate_id or entry.substrate).strip()
+    product = (entry.product_id or entry.product).strip()
+    mutation = entry.mutation.strip() or ("unspecified mutant" if entry.is_mutant else "WT")
+    return ObservationKey(
+        enzyme_id=enzyme_id.strip().upper(),
+        substrate_id=substrate,
+        product_id=product,
+        temperature=entry.temperature,
+        ph=entry.ph,
+        ionic_conditions=entry.ionic_conditions.strip(),
+        mutation=mutation,
+    )
 
 
 @dataclass
@@ -264,6 +299,14 @@ class BRENDAParser:
                 "source_db": e.source_db,
                 "source_id": e.source_id,
                 "is_mutant": e.is_mutant,
+                "comment": e.comment,
+                "product": e.product,
+                "substrate_id": e.substrate_id,
+                "product_id": e.product_id,
+                "ionic_conditions": e.ionic_conditions,
+                "mutation": e.mutation,
+                "detected": e.detected,
+                "detection_limit": e.detection_limit,
             })
         path.write_text(json.dumps(data, indent=2))
 
@@ -400,6 +443,12 @@ class SABIORKClient:
 
         uniprot = str(law.get("uniprotId", law.get("UniProtId", ""))).strip()
         substrate = str(law.get("substrate", law.get("Substrate", ""))).strip()
+        product = str(law.get("product", law.get("Product", ""))).strip()
+        substrate_id = str(law.get("substrateId", law.get("SubstrateID", ""))).strip()
+        product_id = str(law.get("productId", law.get("ProductID", ""))).strip()
+        ionic_conditions = str(
+            law.get("ionicConditions", law.get("IonicConditions", ""))
+        ).strip()
 
         # Conditions
         ph = law.get("pH", law.get("ph"))
@@ -415,6 +464,7 @@ class SABIORKClient:
             temp = None
 
         is_mutant = bool(law.get("isMutant", law.get("HasMutant", False)))
+        mutation = str(law.get("mutation", law.get("Mutation", ""))).strip()
         law_id = str(law.get("kineticLawId", law.get("EntryID", "")))
 
         for param in parameters:
@@ -449,6 +499,11 @@ class SABIORKClient:
                 source_db="SABIO-RK",
                 source_id=f"SABIO-RK:{law_id}",
                 is_mutant=is_mutant,
+                product=product,
+                substrate_id=substrate_id,
+                product_id=product_id,
+                ionic_conditions=ionic_conditions,
+                mutation=mutation,
             ))
 
         return entries
@@ -489,6 +544,14 @@ class SABIORKClient:
                 "source_db": e.source_db,
                 "source_id": e.source_id,
                 "is_mutant": e.is_mutant,
+                "comment": e.comment,
+                "product": e.product,
+                "substrate_id": e.substrate_id,
+                "product_id": e.product_id,
+                "ionic_conditions": e.ionic_conditions,
+                "mutation": e.mutation,
+                "detected": e.detected,
+                "detection_limit": e.detection_limit,
             })
         path.write_text(json.dumps(data, indent=2))
 
@@ -592,51 +655,64 @@ class KineticsAggregator:
     def build_ec_kinetics_map(
         self,
         entries: List[KineticEntry],
-    ) -> Dict[str, Dict[str, float]]:
-        """Aggregate entries into median values per (EC, param_type).
+    ) -> Dict[ObservationKey, Dict[str, Any]]:
+        """Aggregate only replicate measurements of the same EC assay.
 
         Returns
         -------
-        dict mapping EC number → {param_type: median_log_value}
+        Canonical observation key → {param_type: median_log_value}
         """
         import numpy as np
 
-        # Group by (ec, param_type)
-        groups: Dict[Tuple[str, str], List[float]] = {}
+        groups: Dict[Tuple[ObservationKey, str], List[float]] = {}
+        result: Dict[ObservationKey, Dict[str, Any]] = {}
         for e in entries:
-            key = (e.ec_number, e.param_type)
-            groups.setdefault(key, []).append(e.log_value)
+            observation = _observation_key(e, e.ec_number)
+            if e.detected is False:
+                result.setdefault(observation, {})["detected"] = False
+                if e.detection_limit is not None and e.detection_limit > 0:
+                    result[observation]["detection_limit_log"] = math.log10(e.detection_limit)
+                continue
+            if e.value > 0:
+                groups.setdefault((observation, e.param_type), []).append(e.log_value)
 
-        result: Dict[str, Dict[str, float]] = {}
-        for (ec, ptype), values in groups.items():
-            result.setdefault(ec, {})[ptype] = float(np.median(values))
+        for (observation, ptype), values in groups.items():
+            result.setdefault(observation, {})[ptype] = float(np.median(values))
+            result[observation]["detected"] = True
 
         return result
 
     def build_pdb_kinetics_map(
         self,
         entries: List[KineticEntry],
-    ) -> Dict[str, Dict[str, float]]:
-        """Aggregate entries into median values per (PDB, param_type).
+    ) -> Dict[ObservationKey, Dict[str, Any]]:
+        """Aggregate only replicate measurements of the same PDB assay.
 
         Only includes entries that have a PDB cross-reference.
 
         Returns
         -------
-        dict mapping PDB ID → {param_type: median_log_value}
+        Canonical observation key → {param_type: median_log_value}
         """
         import numpy as np
 
-        groups: Dict[Tuple[str, str], List[float]] = {}
+        groups: Dict[Tuple[ObservationKey, str], List[float]] = {}
+        result: Dict[ObservationKey, Dict[str, Any]] = {}
         for e in entries:
             if not e.has_pdb:
                 continue
-            key = (e.pdb_id, e.param_type)
-            groups.setdefault(key, []).append(e.log_value)
+            observation = _observation_key(e, e.pdb_id)
+            if e.detected is False:
+                result.setdefault(observation, {})["detected"] = False
+                if e.detection_limit is not None and e.detection_limit > 0:
+                    result[observation]["detection_limit_log"] = math.log10(e.detection_limit)
+                continue
+            if e.value > 0:
+                groups.setdefault((observation, e.param_type), []).append(e.log_value)
 
-        result: Dict[str, Dict[str, float]] = {}
-        for (pdb_id, ptype), values in groups.items():
-            result.setdefault(pdb_id, {})[ptype] = float(np.median(values))
+        for (observation, ptype), values in groups.items():
+            result.setdefault(observation, {})[ptype] = float(np.median(values))
+            result[observation]["detected"] = True
 
         return result
 

@@ -51,6 +51,13 @@ from tope.models.cross_attention import (
     MultiHeadCrossAttention,
     SubstrateProductCrossAttention,
 )
+from tope.models.domain_discovery import (
+    DomainDiscoveryConfig,
+    DomainDiscoveryHead,
+    DomainSubstrateAttention,
+    permutation_match,
+    soft_domain_pool,
+)
 from tope.models.task_heads import (
     TaskHeadsConfig,
     ECClassificationHead,
@@ -193,6 +200,12 @@ __all__ = [
     "MoleculeGNN",
     "MultiHeadCrossAttention",
     "SubstrateProductCrossAttention",
+    # Self-supervised latent domains
+    "DomainDiscoveryConfig",
+    "DomainDiscoveryHead",
+    "DomainSubstrateAttention",
+    "permutation_match",
+    "soft_domain_pool",
     # Task heads
     "TaskHeadsConfig",
     "ECClassificationHead",

@@ -33,6 +33,18 @@ from tope.quantum.voip_siren import (
     VOIPSheafSectionBuilder,
 )
 from tope.quantum.gyro_dnc import GyroMemory
+from tope.quantum.electronic_complex import (
+    AdaptiveElectronicReadout,
+    ElectronicCochain,
+    ElectronicComplexConfig,
+    ElectronicComplexEncoder,
+    GeometryConditionedElectronicPool,
+    GeometryElectronicFeedback,
+    MultiresolutionElectronicFingerprint,
+    dense_membership_to_incidence,
+    hierarchical_candidate_indices,
+    local_cell_frames,
+)
 
 __all__ = [
     "VOIPSIRENConfig",
@@ -47,4 +59,15 @@ __all__ = [
     "VOIPSheafSectionBuilder",
     # Phase 5G
     "GyroMemory",
+    # Geometry-aware multirank electronic cochains
+    "ElectronicComplexConfig",
+    "ElectronicCochain",
+    "MultiresolutionElectronicFingerprint",
+    "GeometryConditionedElectronicPool",
+    "ElectronicComplexEncoder",
+    "AdaptiveElectronicReadout",
+    "GeometryElectronicFeedback",
+    "dense_membership_to_incidence",
+    "hierarchical_candidate_indices",
+    "local_cell_frames",
 ]

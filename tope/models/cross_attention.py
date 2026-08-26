@@ -44,6 +44,7 @@ class CrossAttentionConfig:
     mol_feat_dim: int = 64         # Input atom feature dim for small molecules
     mol_hidden_dim: int = 128      # GNN hidden dim for small molecules
     mol_n_layers: int = 3          # GNN message-passing layers
+    mol_edge_feat_dim: int = 7     # bond order + directional stereo
     enzyme_hidden_dim: int = 256   # Enzyme TCPNet hidden dim (must match)
     n_heads: int = 8               # Multi-head attention heads
     dropout: float = 0.1
@@ -54,10 +55,11 @@ class CrossAttentionConfig:
 class MoleculeGNNLayer(nn.Module):
     """One GNN layer for small-molecule encoding (message-passing + update)."""
 
-    def __init__(self, hidden_dim: int, dropout: float = 0.1):
+    def __init__(self, hidden_dim: int, edge_feat_dim: int = 7,
+                 dropout: float = 0.1):
         super().__init__()
         self.msg_mlp = nn.Sequential(
-            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.Linear(2 * hidden_dim + edge_feat_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
@@ -73,6 +75,7 @@ class MoleculeGNNLayer(nn.Module):
         self,
         h: torch.Tensor,
         edge_index: torch.Tensor,
+        edge_features: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Parameters
@@ -86,7 +89,7 @@ class MoleculeGNNLayer(nn.Module):
         """
         row, col = edge_index
         # Build messages from pairs
-        msg_input = torch.cat([h[row], h[col]], dim=-1)  # (E, 2H)
+        msg_input = torch.cat([h[row], h[col], edge_features], dim=-1)
         msgs = self.msg_mlp(msg_input)                   # (E, H)
 
         # Aggregate messages (scatter-add)
@@ -105,13 +108,14 @@ class MoleculeGNN(nn.Module):
 
     def __init__(self, cfg: CrossAttentionConfig):
         super().__init__()
+        self.cfg = cfg
         self.embed = nn.Sequential(
             nn.Linear(cfg.mol_feat_dim, cfg.mol_hidden_dim),
             nn.SiLU(),
             nn.Linear(cfg.mol_hidden_dim, cfg.mol_hidden_dim),
         )
         self.layers = nn.ModuleList([
-            MoleculeGNNLayer(cfg.mol_hidden_dim, cfg.dropout)
+            MoleculeGNNLayer(cfg.mol_hidden_dim, cfg.mol_edge_feat_dim, cfg.dropout)
             for _ in range(cfg.mol_n_layers)
         ])
         # Project to enzyme hidden dim for cross-attention compatibility
@@ -121,6 +125,7 @@ class MoleculeGNN(nn.Module):
         self,
         node_features: torch.Tensor,
         edge_index: torch.Tensor,
+        edge_features: torch.Tensor,
     ) -> torch.Tensor:
         """
         Parameters
@@ -133,8 +138,10 @@ class MoleculeGNN(nn.Module):
         h_mol : (M, enzyme_hidden_dim)
         """
         h = self.embed(node_features)
+        if edge_features is None:
+            edge_features = h.new_zeros((edge_index.size(1), self.cfg.mol_edge_feat_dim))
         for layer in self.layers:
-            h = layer(h, edge_index)
+            h = layer(h, edge_index, edge_features)
         return self.proj(h)
 
 
@@ -335,10 +342,12 @@ class SubstrateProductCrossAttention(nn.Module):
         h_sub = self.substrate_gnn(
             substrate_data["node_features"],
             substrate_data["edge_index"],
+            substrate_data["edge_features"],
         )
         h_prod = self.product_gnn(
             product_data["node_features"],
             product_data["edge_index"],
+            product_data["edge_features"],
         )
 
         # Cross-attend: enzyme ← substrate
@@ -357,6 +366,8 @@ class SubstrateProductCrossAttention(nn.Module):
         attn_maps = {
             "substrate": attn_sub,
             "product": attn_prod,
+            "h_substrate_attended": h_enz_sub,
+            "h_product_attended": h_enz_prod,
         }
 
         return h_fused, attn_maps

@@ -44,6 +44,15 @@ from tope.models.task_heads import (
     DistantMutationEffectPredictor,
 )
 from tope.models.whole_protein_tcpnet import WholeProteinTCPNet, WholeProteinConfig
+from tope.models.domain_discovery import (
+    DomainDiscoveryConfig,
+    DomainDiscoveryHead,
+    DomainSubstrateAttention,
+)
+from tope.quantum.electronic_complex import (
+    ElectronicComplexConfig,
+    ElectronicComplexEncoder,
+)
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -210,7 +219,7 @@ class ToPEModel(nn.Module):
             substrate_data = batch["substrate"]
             product_data = batch["product"]
 
-            h_fused, attn_maps = self.cross_attention(
+            _h_fused, attn_maps = self.cross_attention(
                 h_nodes,
                 substrate_data,
                 product_data,
@@ -219,17 +228,12 @@ class ToPEModel(nn.Module):
                 product_batch=product_data.get("batch"),
             )
 
-            # Pool fused node features to graph level
-            h_fused_pooled = self.cross_pool(h_fused, enzyme_batch)
-
-            # For the heads, we need separate substrate-attended and
-            # product-attended pooled features.  We approximate by using
-            # the fused pooled as "substrate-attended" and the base
-            # enzyme embedding as a stand-in — but more precisely we can
-            # pool from the attention outputs.  For now, use the fused
-            # representation for both roles.
-            h_sub_attended = h_fused_pooled
-            h_prod_attended = enzyme_embedding  # base enzyme as comparison
+            h_sub_attended = self.cross_pool(
+                attn_maps["h_substrate_attended"], enzyme_batch
+            )
+            h_prod_attended = self.cross_pool(
+                attn_maps["h_product_attended"], enzyme_batch
+            )
 
         # ─── 3. Multi-task prediction heads ───
         head_outputs = self.heads(
@@ -305,6 +309,17 @@ class CompleteToPEConfig:
     mol_n_layers: int = 3
     use_cross_attention: bool = True
 
+    # Label-free latent domain discovery
+    use_domain_discovery: bool = True
+    max_latent_domains: int = 8
+    sequence_feat_dim: int = 21
+
+    # Optional multiresolution electronic cochain stack
+    use_electronic_complex: bool = False
+    electronic_spectrum_dim: int = 32
+    electronic_hidden_dim: int = 128
+    electronic_max_ranks: int = 6
+
     def to_whole_protein_config(self) -> WholeProteinConfig:
         return WholeProteinConfig(
             zone1_feat_dim=self.zone1_feat_dim,
@@ -334,6 +349,22 @@ class CompleteToPEConfig:
             mol_n_layers=self.mol_n_layers,
             enzyme_hidden_dim=self.hidden_dim,
             n_heads=self.n_heads,
+            dropout=self.dropout,
+        )
+
+    def to_domain_discovery_config(self) -> DomainDiscoveryConfig:
+        return DomainDiscoveryConfig(
+            hidden_dim=self.hidden_dim,
+            sequence_feat_dim=self.sequence_feat_dim,
+            max_domains=self.max_latent_domains,
+            dropout=self.dropout,
+        )
+
+    def to_electronic_complex_config(self) -> ElectronicComplexConfig:
+        return ElectronicComplexConfig(
+            spectrum_dim=self.electronic_spectrum_dim,
+            hidden_dim=self.electronic_hidden_dim,
+            max_ranks=self.electronic_max_ranks,
             dropout=self.dropout,
         )
 
@@ -375,6 +406,30 @@ class CompleteToPEModel(nn.Module):
 
         self.cross_pool = GlobalAttentionPooling(H)
 
+        if self.cfg.use_domain_discovery:
+            self.domain_discovery = DomainDiscoveryHead(
+                self.cfg.to_domain_discovery_config()
+            )
+            self.domain_substrate_attention = DomainSubstrateAttention(
+                H, self.cfg.n_heads, self.cfg.dropout
+            )
+            self.domain_residue_norm = nn.LayerNorm(H)
+        else:
+            self.domain_discovery = None
+            self.domain_substrate_attention = None
+            self.domain_residue_norm = None
+
+        if self.cfg.use_electronic_complex:
+            self.electronic_complex = ElectronicComplexEncoder(
+                self.cfg.to_electronic_complex_config()
+            )
+            self.electronic_domain_projection = nn.Linear(
+                self.cfg.electronic_hidden_dim, H
+            )
+        else:
+            self.electronic_complex = None
+            self.electronic_domain_projection = None
+
         # Task heads (whole-protein version)
         self.heads = WholeProteinTaskHeads(self.cfg.to_task_heads_config())
 
@@ -386,7 +441,11 @@ class CompleteToPEModel(nn.Module):
         # Kinetic head reference for external access
         self.kinetic_head = self.heads.kinetics_head
 
-    def forward(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+    def forward(
+        self,
+        batch: Dict[str, Any],
+        masked_domains: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
         """
         Parameters
         ----------
@@ -411,14 +470,103 @@ class CompleteToPEModel(nn.Module):
         batch_idx = pg.get("batch")
         zone_assigns = pg["zone_assignments"]
 
+        domain_outputs = None
+        domain_losses = None
+        electronic_fingerprint = None
+        h_residues_domain = h_residues
+        if self.domain_discovery is not None:
+            domain_outputs = self.domain_discovery(
+                h_residues,
+                batch=batch_idx,
+                sequence_features=pg.get("sequence_features"),
+            )
+            if batch.get("compute_domain_losses", self.training):
+                masked_residues = pg.get("masked_residues")
+                loss_domain_outputs = domain_outputs
+                if masked_residues is None and self.training:
+                    masked_residues = torch.rand(
+                        h_residues.size(0), device=h_residues.device
+                    ) < self.domain_discovery.cfg.mask_probability
+                    if not masked_residues.any() and masked_residues.numel():
+                        masked_residues[0] = True
+                if masked_residues is not None and masked_residues.any():
+                    masked_h = h_residues.clone()
+                    masked_h[masked_residues] = 0.0
+                    masked_sequence = pg.get("sequence_features")
+                    if masked_sequence is not None:
+                        masked_sequence = masked_sequence.clone()
+                        masked_sequence[masked_residues] = 0.0
+                    loss_domain_outputs = self.domain_discovery(
+                        masked_h,
+                        batch=batch_idx,
+                        sequence_features=masked_sequence,
+                    )
+                perturbed_assignments = batch.get("perturbed_domain_assignments")
+                if perturbed_assignments is None and self.training:
+                    noisy_h = h_residues + self.domain_discovery.cfg.perturbation_noise * torch.randn_like(
+                        h_residues
+                    )
+                    perturbed_assignments = self.domain_discovery(
+                        noisy_h,
+                        batch=batch_idx,
+                        sequence_features=pg.get("sequence_features"),
+                    )["assignments"]
+                domain_losses = self.domain_discovery.losses(
+                    loss_domain_outputs,
+                    h_residues,
+                    pg["edge_index"],
+                    batch=batch_idx,
+                    chain_index=pg.get("chain_index"),
+                    sequence_index=pg.get("sequence_index"),
+                    masked_residues=masked_residues,
+                    perturbed_assignments=perturbed_assignments,
+                )
+            # Soft domain→residue restriction map closes the learned
+            # residue↔domain cross-rank path before substrate attention.
+            if batch_idx is None:
+                domain_batch = torch.zeros(
+                    h_residues.size(0), dtype=torch.long, device=h_residues.device
+                )
+            else:
+                domain_batch = batch_idx
+            domain_broadcast = torch.empty_like(h_residues)
+            for graph_id in range(domain_outputs["domain_embeddings"].size(0)):
+                mask = domain_batch == graph_id
+                domain_broadcast[mask] = (
+                    domain_outputs["assignments"][mask]
+                    @ domain_outputs["domain_embeddings"][graph_id]
+                )
+            h_residues_domain = self.domain_residue_norm(
+                h_residues + domain_broadcast
+            )
+
+        if self.electronic_complex is not None and batch.get("electronic_complex") is not None:
+            electronic_inputs = dict(batch["electronic_complex"])
+            residue_rank = int(electronic_inputs.pop("residue_rank", -1))
+            electronic_fingerprint = self.electronic_complex(**electronic_inputs)
+            if domain_outputs is not None:
+                residue_cells = electronic_fingerprint.cochains[residue_rank].scalar.size(0)
+                if residue_cells != domain_outputs["assignments"].size(0):
+                    raise ValueError(
+                        "electronic residue rank must align with latent-domain residues"
+                    )
+                electronic_fingerprint = self.electronic_complex.append_soft_rank(
+                    electronic_fingerprint,
+                    domain_outputs["assignments"],
+                    rank_name="learned_domain",
+                    source_rank=residue_rank,
+                )
+
         # Reshape h_residues for heads: (B, N_res, H)
         # For single-graph case, add batch dim
         if h_residues.dim() == 2 and (batch_idx is None or batch_idx.max() == 0):
-            h_res_3d = h_residues.unsqueeze(0)
+            h_res_3d = h_residues_domain.unsqueeze(0)
             zone_3d = zone_assigns.unsqueeze(0)
         else:
             # Multi-graph batching: group by batch index
-            h_res_3d, zone_3d = _batch_residues(h_residues, zone_assigns, batch_idx)
+            h_res_3d, zone_3d = _batch_residues(
+                h_residues_domain, zone_assigns, batch_idx
+            )
 
         # ─── 2. Optional cross-attention ───
         h_sub_attended = None
@@ -428,16 +576,59 @@ class CompleteToPEModel(nn.Module):
         has_prod = "product" in batch and batch["product"] is not None
 
         if self.cross_attention is not None and has_sub and has_prod:
-            h_fused, _ = self.cross_attention(
-                h_residues,
+            _h_fused, attended = self.cross_attention(
+                h_residues_domain,
                 batch["substrate"],
                 batch["product"],
                 enzyme_batch=batch_idx,
                 substrate_batch=batch["substrate"].get("batch"),
                 product_batch=batch["product"].get("batch"),
             )
-            h_sub_attended = self.cross_pool(h_fused, batch_idx)
-            h_prod_attended = enzyme_embedding
+            h_sub_attended = self.cross_pool(
+                attended["h_substrate_attended"], batch_idx
+            )
+            h_prod_attended = self.cross_pool(
+                attended["h_product_attended"], batch_idx
+            )
+            if domain_outputs is not None:
+                substrate_domain_embeddings = []
+                assignments = domain_outputs["assignments"]
+                if batch_idx is None:
+                    domain_batch = torch.zeros(
+                        h_residues.size(0), dtype=torch.long, device=h_residues.device
+                    )
+                else:
+                    domain_batch = batch_idx
+                n_graphs = domain_outputs["domain_embeddings"].size(0)
+                for graph_id in range(n_graphs):
+                    mask = domain_batch == graph_id
+                    q_g = assignments[mask]
+                    h_g = attended["h_substrate_attended"][mask]
+                    pooled = q_g.transpose(0, 1) @ h_g
+                    pooled = pooled / q_g.sum(dim=0).clamp_min(1e-8).unsqueeze(-1)
+                    substrate_domain_embeddings.append(pooled)
+                substrate_domain_embeddings = torch.stack(substrate_domain_embeddings)
+                if electronic_fingerprint is not None:
+                    if substrate_domain_embeddings.size(0) != 1:
+                        raise ValueError(
+                            "batched electronic fingerprints require one hierarchy per graph"
+                        )
+                    electronic_domains = electronic_fingerprint.cochains[-1].embedding
+                    if electronic_domains.size(0) != substrate_domain_embeddings.size(1):
+                        raise ValueError("electronic and geometric latent-domain counts differ")
+                    substrate_domain_embeddings = substrate_domain_embeddings + (
+                        self.electronic_domain_projection(electronic_domains).unsqueeze(0)
+                    )
+                h_sub_attended, domain_attention = self.domain_substrate_attention(
+                    h_sub_attended,
+                    substrate_domain_embeddings,
+                    domain_outputs["domain_mass"],
+                    masked_domains,
+                )
+            else:
+                domain_attention = None
+        else:
+            domain_attention = None
 
         # ─── 3. Task heads ───
         outputs = self.heads(
@@ -449,9 +640,35 @@ class CompleteToPEModel(nn.Module):
         )
 
         outputs["enzyme_embedding"] = enzyme_embedding
-        outputs["h_residues"] = h_residues
+        outputs["h_residues"] = h_residues_domain
+        outputs["h_residues_pre_domain"] = h_residues
+        outputs["latent_domains"] = domain_outputs
+        outputs["domain_losses"] = domain_losses
+        outputs["domain_substrate_attention"] = domain_attention
+        outputs["electronic_fingerprint"] = electronic_fingerprint
 
         return outputs
+
+    @torch.no_grad()
+    def counterfactual_domain_specificity(
+        self, batch: Dict[str, Any]
+    ) -> torch.Tensor:
+        """Return Δ_k(s)=ŷ(e,s)-ŷ(e without latent domain k,s)."""
+        was_training = self.training
+        self.eval()
+        baseline = self(batch)
+        if baseline.get("log_efficiency") is None or baseline.get("latent_domains") is None:
+            raise ValueError("counterfactual specificity requires molecules and domain discovery")
+        base_y = baseline["log_efficiency"]
+        mass = baseline["latent_domains"]["domain_mass"]
+        deltas = []
+        for domain_idx in range(mass.size(1)):
+            mask = torch.zeros_like(mass, dtype=torch.bool)
+            mask[:, domain_idx] = True
+            masked_y = self(batch, masked_domains=mask)["log_efficiency"]
+            deltas.append(base_y - masked_y)
+        self.train(was_training)
+        return torch.cat(deltas, dim=-1)
 
     def count_parameters(self) -> Dict[str, int]:
         counts = {}
@@ -470,6 +687,24 @@ class CompleteToPEModel(nn.Module):
         counts["mutation_head"] = sum(
             p.numel() for p in self.mutation_head.parameters() if p.requires_grad
         )
+        if self.domain_discovery is not None:
+            counts["domain_discovery"] = sum(
+                p.numel() for p in self.domain_discovery.parameters() if p.requires_grad
+            ) + sum(
+                p.numel() for p in self.domain_substrate_attention.parameters()
+                if p.requires_grad
+            ) + sum(
+                p.numel() for p in self.domain_residue_norm.parameters()
+                if p.requires_grad
+            )
+        if self.electronic_complex is not None:
+            counts["electronic_complex"] = sum(
+                p.numel() for p in self.electronic_complex.parameters()
+                if p.requires_grad
+            ) + sum(
+                p.numel() for p in self.electronic_domain_projection.parameters()
+                if p.requires_grad
+            )
         counts["total"] = sum(counts.values())
         return counts
 

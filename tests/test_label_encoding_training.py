@@ -164,7 +164,8 @@ def test_full_tope_model_training_step(tmp_path):
         n_tcpnet_layers=2, n_heads=2, ec_levels=vocab.level_sizes,
         head_hidden_dim=16, use_cross_attention=False, use_e3nn=False,
     )
-    model = _tope_model.ToPEModel(cfg)
+    with pytest.warns(DeprecationWarning, match="active-site crop"):
+        model = _tope_model.ToPEModel(cfg)
     loss_fn = _losses.MultiTaskLoss()
     opt = torch.optim.Adam(list(model.parameters()) + list(loss_fn.parameters()), lr=1e-3)
 

@@ -33,6 +33,7 @@ from tope.training.evaluation import (
     LongRangeMutationValidator,
     AllostericPathwayVisualiser,
 )
+from tope.training.domain_evaluation import boundary_f1, evaluate_domains
 
 __all__ = [
     # Trainer
@@ -56,4 +57,6 @@ __all__ = [
     "IoffeInverseRecognition",
     "LongRangeMutationValidator",
     "AllostericPathwayVisualiser",
+    "boundary_f1",
+    "evaluate_domains",
 ]

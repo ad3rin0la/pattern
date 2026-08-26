@@ -6,8 +6,8 @@ suitable for downstream topological encoding (Phase 2) and model training
 (Phase 3). Supports Parquet, CSV, and HDF5 output, plus a native NumPy
 archive for direct consumption by PyTorch / PyG data loaders.
 
-The dataset schema follows the ToPE convention:
-    - One row per active site (not per atom)
+The dataset schema follows the specificity-preserving ToPE convention:
+    - One row per enzyme–substrate–condition observation (not per protein)
     - Atomic-level data stored as variable-length arrays within each row
     - Metadata columns for PDB ID, EC number, split, and kinetics labels
 """
@@ -28,6 +28,25 @@ from tope.data.features import ActiveSiteFeatures
 
 logger = logging.getLogger(__name__)
 
+
+def _observations_for_site(
+    kinetics_map: Dict[Any, Dict[str, Any]], pdb_id: str,
+) -> List[Tuple[Any, Dict[str, Any]]]:
+    """Select canonical observations for one structure.
+
+    String-keyed maps remain supported as a legacy single-observation format.
+    New maps are keyed by ``ObservationKey`` and therefore expand one enzyme
+    structure into one dataset row per substrate/condition assay.
+    """
+    if pdb_id in kinetics_map:
+        return [(None, kinetics_map[pdb_id])]
+    pid = pdb_id.upper()
+    return [
+        (key, values)
+        for key, values in kinetics_map.items()
+        if getattr(key, "enzyme_id", "").upper() == pid
+    ]
+
 # Optional heavy I/O libraries.
 try:
     import pandas as pd
@@ -47,7 +66,7 @@ except ImportError:
 
 @dataclass
 class DatasetRecord:
-    """One processed active-site sample ready for storage."""
+    """One enzyme–substrate assay row linked to processed structure arrays."""
 
     pdb_id: str
     ec_number: str
@@ -74,6 +93,18 @@ class DatasetRecord:
     # the substrate/product graphs the cross-attention + kinetics head consume.
     substrate_smiles: str = ""
     product_smiles: str = ""
+
+    # Canonical enzyme–substrate assay identity. Multiple records may share
+    # the same structure arrays but must never share distinct substrate labels.
+    enzyme_id: str = ""
+    substrate_id: str = ""
+    product_id: str = ""
+    temperature: Optional[float] = None
+    ph: Optional[float] = None
+    ionic_conditions: str = ""
+    mutation: str = "WT"
+    detected: Optional[bool] = None
+    detection_limit_log: Optional[float] = None
 
     # Train / val / test split
     split: str = ""
@@ -107,7 +138,7 @@ class DatasetBuilder:
         features_list: List[ActiveSiteFeatures],
         split_ratios: Tuple[float, float, float] = (0.8, 0.1, 0.1),
         seed: int = 42,
-        kinetics_map: Optional[Dict[str, Dict[str, float]]] = None,
+        kinetics_map: Optional[Dict[Any, Dict[str, Any]]] = None,
         molecule_map: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> List[DatasetRecord]:
         """Build the full dataset from active sites and their features.
@@ -177,37 +208,45 @@ class DatasetBuilder:
 
             ec_top = site.ec_number.split(".")[0] if site.ec_number else ""
 
-            # Look up kinetics labels
-            kin = kinetics_map.get(site.pdb_id, {})
-            log_kcat = kin.get("kcat")
-            log_km = kin.get("Km")
-            log_kcat_km = kin.get("kcat/Km")
+            observations = _observations_for_site(kinetics_map, site.pdb_id)
+            if not observations:
+                observations = [(None, {})]
 
-            # Look up reaction-molecule SMILES (substrate / product).
-            mol = molecule_map.get(site.pdb_id, {})
-
-            record = DatasetRecord(
-                pdb_id=site.pdb_id,
-                ec_number=site.ec_number,
-                ec_top_level=ec_top,
-                n_atoms=site.n_atoms,
-                n_residues=site.n_residues,
-                n_catalytic_residues=site.n_catalytic_residues,
-                has_metal=site.has_metal,
-                elements=sorted(site.elements),
-                coords_path=str(coords_path.relative_to(self.features_dir)),
-                features_path=str(features_path.relative_to(self.features_dir)),
-                mask_path=str(mask_path.relative_to(self.features_dir)),
-                adjacency_dir=str(adj_dir.relative_to(self.features_dir)),
-                atom_residue_path=str(atom_residue_path.relative_to(self.features_dir)),
-                log_kcat=log_kcat,
-                log_km=log_km,
-                log_kcat_km=log_kcat_km,
-                substrate_smiles=str(mol.get("substrate", "")),
-                product_smiles=str(mol.get("product", "")),
-                split=str(split_labels[i]),
-            )
-            records.append(record)
+            for observation, kin in observations:
+                # A molecule map may be keyed by the full observation or by PDB
+                # for legacy single-substrate datasets.
+                mol = molecule_map.get(observation, molecule_map.get(site.pdb_id, {}))
+                record = DatasetRecord(
+                    pdb_id=site.pdb_id,
+                    ec_number=site.ec_number,
+                    ec_top_level=ec_top,
+                    n_atoms=site.n_atoms,
+                    n_residues=site.n_residues,
+                    n_catalytic_residues=site.n_catalytic_residues,
+                    has_metal=site.has_metal,
+                    elements=sorted(site.elements),
+                    coords_path=str(coords_path.relative_to(self.features_dir)),
+                    features_path=str(features_path.relative_to(self.features_dir)),
+                    mask_path=str(mask_path.relative_to(self.features_dir)),
+                    adjacency_dir=str(adj_dir.relative_to(self.features_dir)),
+                    atom_residue_path=str(atom_residue_path.relative_to(self.features_dir)),
+                    log_kcat=kin.get("kcat"),
+                    log_km=kin.get("Km"),
+                    log_kcat_km=kin.get("kcat/Km"),
+                    substrate_smiles=str(mol.get("substrate", "")),
+                    product_smiles=str(mol.get("product", "")),
+                    enzyme_id=getattr(observation, "enzyme_id", site.pdb_id),
+                    substrate_id=getattr(observation, "substrate_id", ""),
+                    product_id=getattr(observation, "product_id", ""),
+                    temperature=getattr(observation, "temperature", None),
+                    ph=getattr(observation, "ph", None),
+                    ionic_conditions=getattr(observation, "ionic_conditions", ""),
+                    mutation=getattr(observation, "mutation", "WT"),
+                    detected=kin.get("detected"),
+                    detection_limit_log=kin.get("detection_limit_log"),
+                    split=str(split_labels[i]),
+                )
+                records.append(record)
 
             if (i + 1) % 100 == 0 or (i + 1) == n:
                 logger.info("Dataset assembly: %d / %d", i + 1, n)
@@ -219,7 +258,7 @@ class DatasetBuilder:
         logger.info(
             "Dataset built: %d samples (train=%d, val=%d, test=%d), "
             "%d with kinetics labels",
-            n,
+            len(records),
             sum(1 for r in records if r.split == "train"),
             sum(1 for r in records if r.split == "val"),
             sum(1 for r in records if r.split == "test"),
@@ -426,5 +465,14 @@ class DatasetBuilder:
             "log_kcat_km": r.log_kcat_km,
             "substrate_smiles": r.substrate_smiles,
             "product_smiles": r.product_smiles,
+            "enzyme_id": r.enzyme_id,
+            "substrate_id": r.substrate_id,
+            "product_id": r.product_id,
+            "temperature": r.temperature,
+            "ph": r.ph,
+            "ionic_conditions": r.ionic_conditions,
+            "mutation": r.mutation,
+            "detected": r.detected,
+            "detection_limit_log": r.detection_limit_log,
             "split": r.split,
         }

@@ -40,6 +40,75 @@ Enzyme Structure (PDB)
 +-----------------------------+
 ```
 
+### Self-supervised latent domains
+
+`CompleteToPEModel` learns a soft residue-to-domain incidence matrix directly
+from TCPNet residue embeddings. Training uses normalized structural cut,
+sequence continuity, domain-bottleneck reconstruction, contact reconstruction,
+permutation-matched perturbation consistency, optional sequence/structure
+agreement, and anti-collapse penalties. No CATH, ECOD, Pfam, or EC labels enter
+the discovery head.
+
+```python
+from tope.models import CompleteToPEConfig, CompleteToPEModel
+
+model = CompleteToPEModel(CompleteToPEConfig(
+    use_domain_discovery=True,
+    max_latent_domains=8,
+    sequence_feat_dim=21,  # default residue identity; replace with richer embeddings
+))
+
+outputs = model(batch)
+Q = outputs["latent_domains"]["assignments"]
+domain_embeddings = outputs["latent_domains"]["domain_embeddings"]
+domain_substrate_attention = outputs["domain_substrate_attention"]
+
+# Delta_k(s) = y(enzyme, substrate) - y(enzyme without domain k, substrate)
+domain_specificity = model.counterfactual_domain_specificity(batch)
+```
+
+Known domain databases are supported only through evaluation utilities such as
+`tope.training.evaluate_domains`, which reports boundary overlap, domain-count
+error, and perturbation stability.
+
+### Multiresolution electronic cochains
+
+`ElectronicComplexEncoder` keeps electronic structure as a cochain on every
+complex rank instead of reducing all atoms to one global fingerprint. Scalar
+spectra, directional orbital channels, quadrupolar channels, charge multipoles,
+spectral multipoles, and coherence are lifted through sparse incidence maps
+using geometry-conditioned weights and cell-local coordinate frames.
+
+```python
+from tope.quantum import ElectronicComplexConfig, ElectronicComplexEncoder
+
+encoder = ElectronicComplexEncoder(ElectronicComplexConfig(
+    spectrum_dim=64,
+    hidden_dim=128,
+    max_ranks=6,
+))
+
+fingerprint = encoder(
+    coords=atom_coords,
+    scalar_spectrum=atom_pdos,
+    charge=mulliken_charge,
+    vector_spectrum=directional_pdos,
+    quadrupole_spectrum=orbital_quadrupoles,
+    incidences=[B_atom_bond, B_bond_motif, B_motif_residue],
+    rank_names=["atom", "bond", "motif", "residue"],
+)
+```
+
+`AdaptiveElectronicReadout` selects both cells and resolution for a query.
+`hierarchical_candidate_indices` first selects nearby coarse cells and then
+descends through their incidence links, bounding the fine-scale candidate set
+without constructing every query-atom pair.
+`append_soft_rank` accepts the learned residue-to-domain matrix `Q`, allowing
+electronic domain fingerprints to condition domain–substrate attention.
+`GeometryElectronicFeedback.energy_and_forces` supplies a differentiable
+geometry→electronic-state→energy→force interface; it is not a substitute for a
+force-trained potential or molecular-dynamics validation.
+
 ## Installation
 
 ```bash
