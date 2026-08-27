@@ -109,6 +109,37 @@ electronic domain fingerprints to condition domain–substrate attention.
 geometry→electronic-state→energy→force interface; it is not a substitute for a
 force-trained potential or molecular-dynamics validation.
 
+### Relativistic Clifford holography
+
+`tope.quantum.relativistic_holography` implements the relativistic Pattern
+state as a Clifford-valued field on the positive-energy mass shell. Canonical
+momenta are mapped exactly to half-rapidity Poincare coordinates, while a fixed
+16-element Dirac basis types every holographic mode as scalar, four-vector,
+antisymmetric tensor, axial vector, or pseudoscalar.
+
+```python
+from tope.quantum import (
+    CliffordHologramLayer,
+    coupled_boost,
+    momentum_to_poincare,
+    project_clifford_hologram,
+)
+
+u = momentum_to_poincare(momentum, mass=electron_mass, c=speed_of_light)
+H = project_clifford_hologram(clifford_field, hyperbolic_modes, volume_weights)
+H_next = CliffordHologramLayer()(H, interaction_H, operation="commutator")
+boosted = coupled_boost(boost_u, u, spinor=psi, clifford=H)
+```
+
+The same gyrovector controls Mobius translation on the mass-shell ball and the
+corresponding `Spin(1,3)` transformation of the spinor/Clifford state. The
+gamma multiplication table is fixed; only typed response coefficients are
+learned. `ElectronicCliffordHologram` connects existing multiresolution
+`ElectronicCochain` objects without mislabeling their symmetric quadrupoles as
+antisymmetric Clifford tensors. These components are structural inductive
+biases and differentiable research primitives, not an X2C implementation or a
+validated relativistic electronic-structure calculation.
+
 ## Installation
 
 ```bash
