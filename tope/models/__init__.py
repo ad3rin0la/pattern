@@ -58,6 +58,20 @@ from tope.models.domain_discovery import (
     permutation_match,
     soft_domain_pool,
 )
+from tope.models.hodge_diffusion import (
+    CoupledTorsionHarmonics,
+    CoupledTorsionState,
+    ElectronicHodgeDiffusion,
+    HodgeDiffusionConfig,
+    HodgeDecomposition,
+    HodgeDiffusionResult,
+    HodgeHeatDiffusion,
+    HodgeSpectrum,
+    hodge_laplacian,
+    hodge_decomposition,
+    torus_heat_decay,
+    validate_boundary_operators,
+)
 from tope.models.task_heads import (
     TaskHeadsConfig,
     ECClassificationHead,
@@ -161,6 +175,19 @@ from tope.models.bidirectional_physics import (
 )
 
 __all__ = [
+    # Hodge and coupled-torsion spectral diffusion
+    "HodgeDiffusionConfig",
+    "HodgeDecomposition",
+    "HodgeSpectrum",
+    "HodgeDiffusionResult",
+    "HodgeHeatDiffusion",
+    "ElectronicHodgeDiffusion",
+    "CoupledTorsionState",
+    "CoupledTorsionHarmonics",
+    "validate_boundary_operators",
+    "hodge_laplacian",
+    "hodge_decomposition",
+    "torus_heat_decay",
     # Bidirectional physics-informed latent model
     "BidirectionalPhysicsConfig",
     "BidirectionalPhysicsToPE",

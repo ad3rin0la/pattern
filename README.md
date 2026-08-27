@@ -140,6 +140,43 @@ antisymmetric Clifford tensors. These components are structural inductive
 biases and differentiable research primitives, not an X2C implementation or a
 validated relativistic electronic-structure calculation.
 
+### Hodge spectral diffusion and coupled torsions
+
+`HodgeHeatDiffusion` generalizes circle heat diffusion to every signed boundary
+rank of a molecular chain complex:
+
+```python
+from tope.models import HodgeHeatDiffusion
+
+# B1: atoms x bonds, B2: bonds x motifs, with B1 @ B2 == 0
+heat = HodgeHeatDiffusion()
+spectra = heat.spectra([B1, B2])
+atom_path = heat.diffuse(atom_field, spectra[0], times=[0.0, 0.1, 1.0])
+```
+
+Each modal coefficient is multiplied by `exp(-t * eigenvalue)`, so large
+diffusion times retain global/harmonic organization while small times restore
+finer structure. `ElectronicHodgeDiffusion` applies the same operation to
+aligned fields in a `MultiresolutionElectronicFingerprint`. Local-frame vector
+and tensor fields are rotated into a common global frame before diffusion by
+default. Real and complex cochains are supported with real-valued diffusion
+times.
+
+`hodge_decomposition` separates any cochain into exact, coexact, and harmonic
+parts, making conserved cycle/cocycle content directly inspectable rather than
+only implicit in zero Laplacian eigenvalues.
+
+`CoupledTorsionHarmonics` uses topology-selected torsion cells rather than the
+complete torsion torus. It includes independent circle modes and pairwise sum
+and difference modes such as `cos(theta_i - theta_j)`. `torus_heat_decay`
+provides the exact `exp(-t * ||k||^2)` decay for arbitrary integer coupled-mode
+wavevectors.
+
+Hodge boundary operators are signed and must satisfy `B_k @ B_{k+1} == 0`.
+Pooling incidences and learned residue-to-domain assignments `Q` remain useful
+memberships, but are not silently treated as boundaries; a valid oriented cell
+complex must be supplied for Hodge diffusion.
+
 ## Installation
 
 ```bash
