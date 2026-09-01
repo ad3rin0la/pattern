@@ -37,6 +37,12 @@ CLIFFORD_GRADES: Tuple[str, ...] = (
     *("axial",) * 4,
     "pseudoscalar",
 )
+GYROTRIGONOMETRIC_CHANNELS: Tuple[str, ...] = (
+    "left_gyrolength", "right_gyrolength",
+    "left_half_rapidity_gamma", "right_half_rapidity_gamma",
+    "left_lorentz_gamma", "right_lorentz_gamma",
+    "gyrocosine", "gyrosine",
+)
 
 
 def _require_complex(dtype: torch.dtype) -> None:
@@ -189,6 +195,197 @@ def mobius_add(left: Tensor, right: Tensor, epsilon: float = 1e-7) -> Tensor:
     return result * ((1.0 - epsilon) / norm.clamp_min(epsilon)).clamp(max=1.0)
 
 
+def poincare_gyrolength(coordinate: Tensor, epsilon: float = 1e-7) -> Tensor:
+    """Return rapidity/geodesic radius ``2 artanh(|u|)`` on the unit ball."""
+    radius = coordinate.norm(dim=-1)
+    if torch.any(radius >= 1):
+        raise ValueError("Poincare coordinates must lie strictly inside the unit ball")
+    return 2.0 * torch.atanh(radius.clamp(max=1.0 - epsilon))
+
+
+def half_rapidity_gamma(coordinate: Tensor) -> Tensor:
+    """Return ``cosh(rapidity/2)=1/sqrt(1-|u|^2)`` for Poincare coordinates."""
+    radius2 = coordinate.square().sum(-1)
+    if torch.any(radius2 >= 1):
+        raise ValueError("Poincare coordinates must lie strictly inside the unit ball")
+    return torch.rsqrt(1.0 - radius2)
+
+
+def lorentz_gamma_from_poincare(coordinate: Tensor) -> Tensor:
+    """Return the physical Lorentz gamma ``cosh(rapidity)``.
+
+    This is ``(1+|u|^2)/(1-|u|^2)``, not the half-rapidity gamma multiplying
+    :func:`spinor_boost`.
+    """
+    radius2 = coordinate.square().sum(-1)
+    if torch.any(radius2 >= 1):
+        raise ValueError("Poincare coordinates must lie strictly inside the unit ball")
+    return (1.0 + radius2) / (1.0 - radius2)
+
+
+def poincare_to_einstein_velocity(coordinate: Tensor, c: float = 1.0) -> Tensor:
+    """Map half-rapidity Poincare coordinates to Einstein velocity coordinates."""
+    if c <= 0:
+        raise ValueError("c must be positive")
+    radius2 = coordinate.square().sum(-1, keepdim=True)
+    if torch.any(radius2 >= 1):
+        raise ValueError("Poincare coordinates must lie strictly inside the unit ball")
+    return 2.0 * c * coordinate / (1.0 + radius2)
+
+
+def einstein_velocity_to_poincare(velocity: Tensor, c: float = 1.0) -> Tensor:
+    """Map a subluminal Einstein velocity to half-rapidity coordinates."""
+    if c <= 0:
+        raise ValueError("c must be positive")
+    beta = velocity / c
+    beta2 = beta.square().sum(-1, keepdim=True)
+    if torch.any(beta2 >= 1):
+        raise ValueError("Einstein velocities must have norm strictly below c")
+    return beta / (1.0 + torch.sqrt(1.0 - beta2))
+
+
+def mobius_gyration(left: Tensor, right: Tensor, vector: Tensor) -> Tensor:
+    """Apply the exact Möbius gyration ``gyr[left,right]`` to a tangent vector."""
+    for label, value in (("left", left), ("right", right)):
+        if torch.any(value.square().sum(-1) >= 1):
+            raise ValueError(f"{label} must lie strictly inside the unit ball")
+    ab = (left * right).sum(-1, keepdim=True)
+    av = (left * vector).sum(-1, keepdim=True)
+    bv = (right * vector).sum(-1, keepdim=True)
+    aa = left.square().sum(-1, keepdim=True)
+    bb = right.square().sum(-1, keepdim=True)
+    denominator = (1.0 + 2.0 * ab + aa * bb).clamp_min(1e-12)
+    coefficient_left = (2.0 / denominator) * (
+        (1.0 + 2.0 * ab) * bv - bb * av
+    )
+    coefficient_right = (2.0 / denominator) * (-av - aa * bv)
+    return vector + coefficient_left * left + coefficient_right * right
+
+
+def mobius_gyration_matrix(left: Tensor, right: Tensor) -> Tensor:
+    """Return the spatial rotation matrix of ``gyr[left,right]``."""
+    if left.shape[-1] != 3 or right.shape[-1] != 3:
+        raise ValueError("relativistic momentum gyrations require three-vectors")
+    identity = torch.eye(3, dtype=left.dtype, device=left.device)
+    target_shape = torch.broadcast_shapes(left.shape[:-1], right.shape[:-1])
+    basis = identity.expand(*target_shape, 3, 3)
+    a = left.expand(*target_shape, 3).unsqueeze(-2)
+    b = right.expand(*target_shape, 3).unsqueeze(-2)
+    # Rows are transformed basis vectors; transpose to the conventional
+    # column-action rotation matrix.
+    return mobius_gyration(a, b, basis).transpose(-1, -2)
+
+
+@dataclass
+class GyrotrigonometricFeatures:
+    """Invariant gyroangle features and the associated Thomas/Wigner rotation."""
+
+    left_gyrolength: Tensor
+    right_gyrolength: Tensor
+    left_half_rapidity_gamma: Tensor
+    right_half_rapidity_gamma: Tensor
+    left_lorentz_gamma: Tensor
+    right_lorentz_gamma: Tensor
+    gyrocosine: Tensor
+    gyrosine: Tensor
+    gyroangle: Tensor
+    plane_normal: Tensor
+    gyration: Tensor
+
+    def as_tensor(self) -> Tensor:
+        """Stack the scalar kernel channels in ``GYROTRIGONOMETRIC_CHANNELS`` order."""
+        return torch.stack([
+            self.left_gyrolength,
+            self.right_gyrolength,
+            self.left_half_rapidity_gamma,
+            self.right_half_rapidity_gamma,
+            self.left_lorentz_gamma,
+            self.right_lorentz_gamma,
+            self.gyrocosine,
+            self.gyrosine,
+        ], dim=-1)
+
+
+def gyrotrigonometric_features(
+    left: Tensor,
+    right: Tensor,
+    *,
+    root: Optional[Tensor] = None,
+    epsilon: float = 1e-7,
+) -> GyrotrigonometricFeatures:
+    """Compute rooted gyroangle invariants for two Poincare-ball points.
+
+    A common root is removed by Möbius translation before measuring the angle.
+    Because the Poincare metric is conformal, normalized dot/cross products of
+    these rooted gyrovectors give the gyrocosine, gyrosine, and oriented plane.
+    At a degenerate zero-length side the angle convention is zero.
+    """
+    if left.shape[-1] != 3 or right.shape[-1] != 3:
+        raise ValueError("gyrotrigonometric features require three-vectors")
+    rooted_left, rooted_right = left, right
+    if root is not None:
+        if root.shape[-1] != 3:
+            raise ValueError("root must be a three-vector")
+        rooted_left = mobius_add(-root, left)
+        rooted_right = mobius_add(-root, right)
+    left_norm = rooted_left.norm(dim=-1)
+    right_norm = rooted_right.norm(dim=-1)
+    valid = (left_norm > epsilon) & (right_norm > epsilon)
+    denominator = (left_norm * right_norm).clamp_min(epsilon)
+    cosine_raw = (rooted_left * rooted_right).sum(-1) / denominator
+    cross = torch.linalg.cross(rooted_left, rooted_right, dim=-1)
+    sine_raw = cross.norm(dim=-1) / denominator
+    cosine = torch.where(valid, cosine_raw.clamp(-1.0, 1.0), torch.ones_like(cosine_raw))
+    sine = torch.where(valid, sine_raw.clamp(0.0, 1.0), torch.zeros_like(sine_raw))
+    normal = torch.where(
+        (cross.norm(dim=-1, keepdim=True) > epsilon),
+        cross / cross.norm(dim=-1, keepdim=True).clamp_min(epsilon),
+        torch.zeros_like(cross),
+    )
+    return GyrotrigonometricFeatures(
+        poincare_gyrolength(rooted_left, epsilon),
+        poincare_gyrolength(rooted_right, epsilon),
+        half_rapidity_gamma(rooted_left),
+        half_rapidity_gamma(rooted_right),
+        lorentz_gamma_from_poincare(rooted_left),
+        lorentz_gamma_from_poincare(rooted_right),
+        cosine,
+        sine,
+        torch.atan2(sine, cosine),
+        normal,
+        mobius_gyration_matrix(rooted_left, rooted_right),
+    )
+
+
+def gyrocosine(left: Tensor, right: Tensor, *, root: Optional[Tensor] = None) -> Tensor:
+    """Return the cosine of the rooted gyroangle between two ball points."""
+    return gyrotrigonometric_features(left, right, root=root).gyrocosine
+
+
+def gyrosine(left: Tensor, right: Tensor, *, root: Optional[Tensor] = None) -> Tensor:
+    """Return the non-negative sine of the rooted gyroangle."""
+    return gyrotrigonometric_features(left, right, root=root).gyrosine
+
+
+def gyroangle(left: Tensor, right: Tensor, *, root: Optional[Tensor] = None) -> Tensor:
+    """Return the rooted gyroangle in radians using ``atan2(gyrosine, gyrocosine)``."""
+    return gyrotrigonometric_features(left, right, root=root).gyroangle
+
+
+def composed_lorentz_gamma(left: Tensor, right: Tensor) -> Tensor:
+    """Einstein gamma composition expressed through Poincare gyrovectors.
+
+    The identity is evaluated in Einstein/Klein velocity coordinates, avoiding
+    the common error of applying ``gamma_a gamma_b (1+a·b)`` directly to
+    half-rapidity Poincare coordinates.
+    """
+    beta_left = poincare_to_einstein_velocity(left)
+    beta_right = poincare_to_einstein_velocity(right)
+    return lorentz_gamma_from_poincare(left) * lorentz_gamma_from_poincare(right) * (
+        1.0 + (beta_left * beta_right).sum(-1)
+    )
+
+
 def spinor_boost(
     gyrovector: Tensor,
     *,
@@ -339,6 +536,80 @@ class CliffordHologramLayer(nn.Module):
         return output + left.to(output.dtype) if self.residual else output
 
 
+@dataclass
+class GyroInteractionResult:
+    """Outputs of a gyrotrigonometric two-state Clifford interaction."""
+
+    combined_coordinate: Tensor
+    features: GyrotrigonometricFeatures
+    composite_spinor: Tensor
+    spinor_clifford: Tensor
+    interaction: Tensor
+
+
+class GyrotrigonometricInteractionKernel(nn.Module):
+    """Learned response constrained by analytic gyrogeometry and Clifford algebra.
+
+    For boosts applied first along ``left`` and then ``right``, the kernel uses
+    ``right (+) left`` and ``S(right) S(left)``.  Non-collinear composition is
+    retained as the exact Möbius gyration and in the spatial-bivector channels
+    of the composite spinor; it is not collapsed into a single pure boost.
+    """
+
+    def __init__(self, hidden_dim: int = 64, spinor_seed: bool = True) -> None:
+        super().__init__()
+        if hidden_dim < 1:
+            raise ValueError("hidden_dim must be positive")
+        self.response = nn.Sequential(
+            nn.Linear(len(GYROTRIGONOMETRIC_CHANNELS), hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 16),
+        )
+        self.spinor_seed = spinor_seed
+        self.spinor_seed_gain = nn.Parameter(torch.tensor(1.0))
+        self.register_buffer("structure", clifford_structure_constants())
+
+    def forward(
+        self,
+        left_coordinate: Tensor,
+        right_coordinate: Tensor,
+        left_clifford: Tensor,
+        right_clifford: Tensor,
+        *,
+        root: Optional[Tensor] = None,
+    ) -> GyroInteractionResult:
+        if left_clifford.shape != right_clifford.shape or left_clifford.shape[-1] != 16:
+            raise ValueError("Clifford states must have equal shapes ending in 16")
+        features = gyrotrigonometric_features(
+            left_coordinate, right_coordinate, root=root
+        )
+        scalar_features = features.as_tensor()
+        scales = 1.0 + 0.1 * torch.tanh(self.response(scalar_features))
+        left_boost = spinor_boost(left_coordinate)
+        right_boost = spinor_boost(right_coordinate)
+        composite_spinor = right_boost @ left_boost
+        spinor_clifford = matrix_to_clifford(composite_spinor)
+
+        extra_axes = left_clifford.dim() - scales.dim()
+        if extra_axes < 0:
+            raise ValueError("Clifford states have fewer batch axes than coordinates")
+        expanded_seed = spinor_clifford
+        for _ in range(extra_axes):
+            scales = scales.unsqueeze(-2)
+            expanded_seed = expanded_seed.unsqueeze(-2)
+        algebraic = clifford_product(left_clifford, right_clifford, self.structure)
+        interaction = algebraic * scales.to(algebraic.dtype)
+        if self.spinor_seed:
+            interaction = interaction + self.spinor_seed_gain.to(algebraic.dtype) * expanded_seed
+        return GyroInteractionResult(
+            mobius_add(right_coordinate, left_coordinate),
+            features,
+            composite_spinor,
+            spinor_clifford,
+            interaction,
+        )
+
+
 class CliffordCommutatorDynamics(nn.Module):
     """Von Neumann dynamics ``dW/dt=-i[H,W]/hbar`` in coefficient space."""
 
@@ -409,12 +680,19 @@ class ElectronicCliffordHologram(nn.Module):
 
 
 __all__ = [
-    "CLIFFORD_CHANNELS", "CLIFFORD_GRADES", "CoupledBoostResult",
+    "CLIFFORD_CHANNELS", "CLIFFORD_GRADES", "GYROTRIGONOMETRIC_CHANNELS",
+    "CoupledBoostResult", "GyroInteractionResult", "GyrotrigonometricFeatures",
     "CliffordCommutatorDynamics", "CliffordHologramLayer",
-    "ElectronicCliffordHologram", "clifford_anticommutator",
+    "ElectronicCliffordHologram", "GyrotrigonometricInteractionKernel",
+    "clifford_anticommutator",
     "clifford_commutator", "clifford_product", "clifford_structure_constants",
-    "clifford_to_matrix", "coupled_boost", "dirac_basis", "dirac_hamiltonian",
-    "dirac_matrices", "hyperbolic_volume_weights", "mass_shell_four_vector",
-    "matrix_to_clifford", "mobius_add", "momentum_to_poincare",
+    "clifford_to_matrix", "composed_lorentz_gamma", "coupled_boost",
+    "dirac_basis", "dirac_hamiltonian", "dirac_matrices",
+    "einstein_velocity_to_poincare", "gyroangle", "gyrocosine", "gyrosine",
+    "gyrotrigonometric_features",
+    "half_rapidity_gamma", "hyperbolic_volume_weights",
+    "lorentz_gamma_from_poincare", "mass_shell_four_vector", "matrix_to_clifford",
+    "mobius_add", "mobius_gyration", "mobius_gyration_matrix",
+    "momentum_to_poincare", "poincare_gyrolength", "poincare_to_einstein_velocity",
     "poincare_to_momentum", "project_clifford_hologram", "spinor_boost",
 ]
