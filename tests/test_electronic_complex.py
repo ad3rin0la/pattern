@@ -1,13 +1,16 @@
 """Multirank geometry-aware electronic fingerprint regression tests."""
 
+import pytest
 import torch
 
+from tope import _core
 from tope.quantum.electronic_complex import (
     AdaptiveElectronicReadout,
     ElectronicComplexConfig,
     ElectronicComplexEncoder,
     GeometryElectronicFeedback,
     hierarchical_candidate_indices,
+    local_cell_frames,
 )
 
 
@@ -152,3 +155,71 @@ def test_geometry_electronic_feedback_produces_finite_forces():
     assert forces.shape == coords.shape
     assert torch.isfinite(energy) and torch.isfinite(forces).all()
     assert len(fingerprint.cochains) == 2
+
+
+def test_segmented_local_frames_are_differentiable_and_handle_sparse_parent_ids():
+    torch.manual_seed(13)
+    coords = torch.randn(7, 3, dtype=torch.double, requires_grad=True)
+    incidence = torch.tensor([
+        [0, 1, 2, 3, 4, 5, 6],
+        [0, 0, 0, 2, 2, 2, 2],
+    ], dtype=torch.long)
+    weights = torch.tensor(
+        [0.2, 0.7, 0.4, 0.5, 0.9, 0.3, 0.8], dtype=torch.double
+    )
+    centers, frames = local_cell_frames(
+        coords, incidence, n_parent=3, weights=weights
+    )
+    assert centers.shape == (3, 3)
+    assert frames.shape == (3, 3, 3)
+    torch.testing.assert_close(centers[1], torch.zeros(3, dtype=torch.double))
+    torch.testing.assert_close(frames[1], torch.eye(3, dtype=torch.double))
+    torch.testing.assert_close(
+        frames.transpose(-1, -2) @ frames,
+        torch.eye(3, dtype=torch.double).expand(3, -1, -1),
+        atol=1e-8,
+        rtol=1e-8,
+    )
+    (centers.square().sum() + 0.1 * frames[:, 0, 0].sum()).backward()
+    assert coords.grad is not None and torch.isfinite(coords.grad).all()
+
+
+def test_tensor_hierarchy_backend_matches_expected_descent():
+    queries = torch.tensor([[0.1, 0.0, 0.0], [3.1, 0.0, 0.0]])
+    centers = [
+        torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+                      [2.0, 0.0, 0.0], [3.0, 0.0, 0.0]]),
+        torch.tensor([[0.5, 0.0, 0.0], [2.5, 0.0, 0.0]]),
+        torch.tensor([[1.5, 0.0, 0.0]]),
+    ]
+    incidences = [
+        torch.tensor([[0, 1, 2, 3], [0, 0, 1, 1]], dtype=torch.long),
+        torch.tensor([[0, 1], [0, 0]], dtype=torch.long),
+    ]
+    candidates = _core.hierarchical_candidates(
+        queries, centers, incidences, top_coarse=1, max_children=2,
+        prefer_native=False,
+    )
+    expected = [
+        torch.tensor([[0, 1], [3, 2]]),
+        torch.tensor([[0, 1], [1, 0]]),
+        torch.tensor([[0], [0]]),
+    ]
+    for actual, wanted in zip(candidates, expected):
+        torch.testing.assert_close(actual, wanted)
+    if _core.native_backend_available():
+        native = _core.hierarchical_candidates(
+            queries, centers, incidences, top_coarse=1, max_children=2
+        )
+        for actual, wanted in zip(native, expected):
+            torch.testing.assert_close(actual, wanted)
+
+
+def test_electronic_incidence_validation_fails_before_kernel_dispatch():
+    coords = torch.randn(3, 3)
+    malformed = torch.tensor([[0, 1], [0, 0]], dtype=torch.int32)
+    with pytest.raises(TypeError, match="torch.long"):
+        local_cell_frames(coords, malformed)
+    out_of_range = torch.tensor([[0, 3], [0, 0]], dtype=torch.long)
+    with pytest.raises(IndexError, match="child index"):
+        local_cell_frames(coords, out_of_range)

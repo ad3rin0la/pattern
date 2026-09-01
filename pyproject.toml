@@ -114,6 +114,7 @@ tope = [
     "data/ec_hierarchy/*.yaml",
     "*.txt",
     "*.md",
+    "csrc/*.cpp",
 ]
 
 [tool.black]

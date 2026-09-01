@@ -103,6 +103,21 @@ fingerprint = encoder(
 `hierarchical_candidate_indices` first selects nearby coarse cells and then
 descends through their incidence links, bounding the fine-scale candidate set
 without constructing every query-atom pair.
+Electronic pooling and local-frame construction use batched segmented ATen
+operations, so they execute in native PyTorch kernels on CPU and supported
+accelerators without a Python loop over cells. An optional C++ CPU backend
+handles the irregular hierarchy traversal:
+
+```bash
+TOPE_NATIVE_BACKEND=build python3 -m pytest -o addopts='' -q \
+  tests/test_electronic_complex.py
+```
+
+The extension is compiled lazily and cached under the system temporary
+directory by default. Set `TOPE_NATIVE_BUILD_DIR` to keep the build elsewhere,
+or call `tope._core.build_native_backend()` explicitly. Accelerator tensors
+continue to use the device-native tensor traversal rather than copying through
+the CPU.
 `append_soft_rank` accepts the learned residue-to-domain matrix `Q`, allowing
 electronic domain fingerprints to condition domain–substrate attention.
 `GeometryElectronicFeedback.energy_and_forces` supplies a differentiable

@@ -3,7 +3,7 @@ include README.md
 include requirements.txt
 include pyproject.toml
 
-recursive-include tope *.py *.json *.yaml *.yml
+recursive-include tope *.py *.cpp *.json *.yaml *.yml
 recursive-include tests *.py
 
 prune .claude

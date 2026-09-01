@@ -14,6 +14,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
+from tope import _core
+
 
 @dataclass
 class ElectronicComplexConfig:
@@ -71,6 +73,50 @@ def _symmetric_traceless(tensor: torch.Tensor) -> torch.Tensor:
     return symmetric - trace[..., None, None] * eye
 
 
+def _segment_sum(
+    values: torch.Tensor,
+    segment_ids: torch.Tensor,
+    n_segments: int,
+) -> torch.Tensor:
+    """Differentiable segmented sum backed by ATen on CPU and accelerators."""
+    output = values.new_zeros((n_segments,) + values.shape[1:])
+    return output.index_add(0, segment_ids, values)
+
+
+def _segment_softmax(
+    logits: torch.Tensor,
+    segment_ids: torch.Tensor,
+    n_segments: int,
+    epsilon: float,
+) -> torch.Tensor:
+    """Softmax independently over every incidence segment."""
+    maxima = logits.new_full((n_segments,), float("-inf"))
+    maxima.scatter_reduce_(0, segment_ids, logits, reduce="amax", include_self=True)
+    unnormalized = (logits - maxima[segment_ids]).exp()
+    normalizer = _segment_sum(unnormalized, segment_ids, n_segments)
+    return unnormalized / normalizer[segment_ids].clamp_min(epsilon)
+
+
+def _validate_incidence(
+    incidence: torch.Tensor,
+    n_child: int,
+    device: torch.device,
+) -> None:
+    if incidence.ndim != 2 or incidence.size(0) != 2:
+        raise ValueError("incidence must have shape (2, n_incidence)")
+    if incidence.dtype != torch.long:
+        raise TypeError("incidence must use torch.long indices")
+    if incidence.device != device:
+        raise ValueError("incidence and child tensors must be on the same device")
+    if incidence.numel() == 0:
+        return
+    child, parent = incidence
+    if int(child.min().item()) < 0 or int(child.max().item()) >= n_child:
+        raise IndexError("incidence contains an out-of-range child index")
+    if int(parent.min().item()) < 0:
+        raise IndexError("incidence contains a negative parent index")
+
+
 def local_cell_frames(
     child_coords: torch.Tensor,
     incidence: torch.Tensor,
@@ -78,47 +124,83 @@ def local_cell_frames(
     weights: Optional[torch.Tensor] = None,
     epsilon: float = 1e-7,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute weighted cell centers and deterministic PCA coordinate frames."""
+    """Compute weighted centers and PCA frames without a Python parent loop."""
+    if child_coords.ndim != 2 or child_coords.size(-1) != 3:
+        raise ValueError("child_coords must have shape (n_child, 3)")
+    _validate_incidence(incidence, child_coords.size(0), child_coords.device)
     child, parent = incidence
     if n_parent is None:
         n_parent = int(parent.max().item()) + 1 if parent.numel() else 0
+    if n_parent < 0 or (parent.numel() and int(parent.max().item()) >= n_parent):
+        raise ValueError("n_parent must cover every parent index")
     weights = weights if weights is not None else torch.ones(
         child.numel(), device=child_coords.device, dtype=child_coords.dtype
     )
-    centers = child_coords.new_zeros((n_parent, 3))
-    frames = _identity_frames(n_parent, child_coords)
-    for parent_id in range(n_parent):
-        mask = parent == parent_id
-        if not mask.any():
-            continue
-        coords = child_coords[child[mask]]
-        w = weights[mask].clamp_min(0)
-        w = w / w.sum().clamp_min(epsilon)
-        center = (w.unsqueeze(-1) * coords).sum(0)
-        centers[parent_id] = center
-        if coords.size(0) < 2:
-            continue
-        rel = coords - center
-        covariance = torch.einsum("n,ni,nj->ij", w, rel, rel)
-        _, eigenvectors = torch.linalg.eigh(covariance)
-        frame = eigenvectors.flip(-1)
-        # Resolve eigenvector signs against the farthest member, then enforce
-        # a right-handed frame. Degenerate cells retain a stable fallback.
-        anchor = rel[rel.square().sum(-1).argmax()]
-        sign0 = torch.where(
-            torch.dot(frame[:, 0], anchor) < 0,
-            frame.new_tensor(-1.0), frame.new_tensor(1.0),
-        )
-        sign1 = torch.where(
-            torch.dot(frame[:, 1], anchor) < 0,
-            frame.new_tensor(-1.0), frame.new_tensor(1.0),
-        )
-        axis0 = frame[:, 0] * sign0
-        axis1 = frame[:, 1] * sign1
-        axis2 = torch.linalg.cross(axis0, axis1)
-        axis2 = axis2 / axis2.norm().clamp_min(epsilon)
-        frame = torch.stack([axis0, axis1, axis2], dim=-1)
-        frames[parent_id] = frame
+    if weights.shape != (child.numel(),):
+        raise ValueError("weights must have one value per incidence")
+    if weights.device != child_coords.device:
+        raise ValueError("weights and child_coords must be on the same device")
+    if n_parent == 0:
+        return child_coords.new_zeros((0, 3)), _identity_frames(0, child_coords)
+
+    positive_weights = weights.to(child_coords.dtype).clamp_min(0)
+    weight_sum = _segment_sum(positive_weights, parent, n_parent)
+    normalized = positive_weights / weight_sum[parent].clamp_min(epsilon)
+    edge_coords = child_coords[child]
+    centers = _segment_sum(normalized[:, None] * edge_coords, parent, n_parent)
+    relative = edge_coords - centers[parent]
+    covariance = _segment_sum(
+        normalized[:, None, None]
+        * torch.einsum("ei,ej->eij", relative, relative),
+        parent,
+        n_parent,
+    )
+    counts = _segment_sum(
+        torch.ones_like(parent, dtype=child_coords.dtype), parent, n_parent
+    )
+    has_frame = (counts >= 2) & (weight_sum > epsilon)
+    identity = _identity_frames(n_parent, child_coords)
+    safe_covariance = torch.where(
+        has_frame[:, None, None], covariance, identity
+    )
+    _, eigenvectors = torch.linalg.eigh(safe_covariance)
+    raw_frame = eigenvectors.flip(-1)
+
+    # Resolve signs against the first farthest member in incidence order.
+    distance2 = relative.square().sum(-1)
+    farthest_distance = distance2.new_full((n_parent,), float("-inf"))
+    farthest_distance.scatter_reduce_(
+        0, parent, distance2, reduce="amax", include_self=True
+    )
+    edge_order = torch.arange(parent.numel(), device=parent.device)
+    sentinel = torch.full_like(edge_order, parent.numel())
+    farthest_order = torch.where(
+        distance2 == farthest_distance[parent], edge_order, sentinel
+    )
+    anchor_index = torch.full(
+        (n_parent,), parent.numel(), device=parent.device, dtype=torch.long
+    )
+    anchor_index.scatter_reduce_(
+        0, parent, farthest_order, reduce="amin", include_self=True
+    )
+    safe_anchor = anchor_index.clamp_max(max(parent.numel() - 1, 0))
+    anchors = relative[safe_anchor] if parent.numel() else centers
+    signs = torch.where(
+        torch.einsum("pi,pi->p", raw_frame[:, :, 0], anchors) < 0,
+        raw_frame.new_tensor(-1.0),
+        raw_frame.new_tensor(1.0),
+    )
+    signs1 = torch.where(
+        torch.einsum("pi,pi->p", raw_frame[:, :, 1], anchors) < 0,
+        raw_frame.new_tensor(-1.0),
+        raw_frame.new_tensor(1.0),
+    )
+    axis0 = raw_frame[:, :, 0] * signs[:, None]
+    axis1 = raw_frame[:, :, 1] * signs1[:, None]
+    axis2 = torch.linalg.cross(axis0, axis1, dim=-1)
+    axis2 = axis2 / axis2.norm(dim=-1, keepdim=True).clamp_min(epsilon)
+    frames = torch.stack([axis0, axis1, axis2], dim=-1)
+    frames = torch.where(has_frame[:, None, None], frames, identity)
     return centers, frames
 
 
@@ -195,17 +277,6 @@ class GeometryConditionedElectronicPool(nn.Module):
             self.cfg.frame_epsilon
         )
 
-        scalar = child_state.scalar.new_zeros((n_parent, self.cfg.spectrum_dim))
-        vector = child_state.vector.new_zeros((n_parent, self.cfg.spectrum_dim, 3))
-        quadrupole = child_state.quadrupole.new_zeros((n_parent, self.cfg.spectrum_dim, 3, 3))
-        embedding = child_state.embedding.new_zeros((n_parent, self.cfg.hidden_dim))
-        charge = child_state.charge.new_zeros(n_parent)
-        dipole = child_state.centers.new_zeros((n_parent, 3))
-        charge_quadrupole = child_state.centers.new_zeros((n_parent, 3, 3))
-        spectral_density = scalar.clone()
-        spectral_dipole = vector.clone()
-        spectral_quadrupole = quadrupole.clone()
-        coherence = child_state.charge.new_zeros(n_parent)
         observables = child_state.scalar.new_zeros(
             (n_parent, self.cfg.rank_observable_dim)
         ) if cell_observables is None else cell_observables
@@ -257,79 +328,97 @@ class GeometryConditionedElectronicPool(nn.Module):
             "eia,esij,ejb->esab",
             frames[parent], child_spectral_quadrupole_global, frames[parent],
         )
-        for parent_id in range(n_parent):
-            mask = parent == parent_id
-            if not mask.any():
-                continue
-            alpha = torch.softmax(logits[mask], dim=0)
-            physical_w = physical_membership[mask]
-            child_ids = child[mask]
-            scalar[parent_id] = (alpha[:, None] * child_state.scalar[child_ids]).sum(0)
-            vector[parent_id] = (alpha[:, None, None] * child_vector_local[mask]).sum(0)
-            quadrupole[parent_id] = _symmetric_traceless(
-                (alpha[:, None, None, None] * child_quadrupole_local[mask]).sum(0)
-            )
-            pooled_embedding = (alpha[:, None] * child_state.embedding[child_ids]).sum(0)
+        alpha = _segment_softmax(logits, parent, n_parent, self.cfg.frame_epsilon)
+        scalar = _segment_sum(
+            alpha[:, None] * child_state.scalar[child], parent, n_parent
+        )
+        vector = _segment_sum(
+            alpha[:, None, None] * child_vector_local, parent, n_parent
+        )
+        quadrupole = _symmetric_traceless(_segment_sum(
+            alpha[:, None, None, None] * child_quadrupole_local,
+            parent,
+            n_parent,
+        ))
+        pooled_embedding = _segment_sum(
+            alpha[:, None] * child_state.embedding[child], parent, n_parent
+        )
 
-            rel_p = rel_local[mask]
-            child_charge = child_state.charge[child_ids]
-            q = child_charge * physical_w
-            charge[parent_id] = q.sum()
-            translated_dipole = child_dipole_local[mask] + child_charge[:, None] * rel_p
-            dipole[parent_id] = (physical_w[:, None] * translated_dipole).sum(0)
-            r2 = rel_p.square().sum(-1)
-            eye = torch.eye(3, device=device, dtype=dtype)
-            raw_q2 = 3.0 * torch.einsum("ni,nj->nij", rel_p, rel_p) - r2[:, None, None] * eye
-            mu = child_dipole_local[mask]
-            dipole_translation = 3.0 * (
-                torch.einsum("ni,nj->nij", rel_p, mu)
-                + torch.einsum("ni,nj->nij", mu, rel_p)
-            ) - 2.0 * (rel_p * mu).sum(-1)[:, None, None] * eye
-            translated_quadrupole = (
-                child_charge_quadrupole_local[mask]
-                + child_charge[:, None, None] * raw_q2
-                + dipole_translation
-            )
-            charge_quadrupole[parent_id] = (
-                physical_w[:, None, None] * translated_quadrupole
-            ).sum(0)
+        edge_charge = child_state.charge[child]
+        charge = _segment_sum(edge_charge * physical_membership, parent, n_parent)
+        translated_dipole = child_dipole_local + edge_charge[:, None] * rel_local
+        dipole = _segment_sum(
+            physical_membership[:, None] * translated_dipole, parent, n_parent
+        )
+        eye = torch.eye(3, device=device, dtype=dtype)
+        radius2 = rel_local.square().sum(-1)
+        raw_q2 = (
+            3.0 * torch.einsum("ei,ej->eij", rel_local, rel_local)
+            - radius2[:, None, None] * eye
+        )
+        dipole_translation = 3.0 * (
+            torch.einsum("ei,ej->eij", rel_local, child_dipole_local)
+            + torch.einsum("ei,ej->eij", child_dipole_local, rel_local)
+        ) - 2.0 * (rel_local * child_dipole_local).sum(-1)[:, None, None] * eye
+        translated_quadrupole = (
+            child_charge_quadrupole_local
+            + edge_charge[:, None, None] * raw_q2
+            + dipole_translation
+        )
+        charge_quadrupole = _segment_sum(
+            physical_membership[:, None, None] * translated_quadrupole,
+            parent,
+            n_parent,
+        )
 
-            child_density = child_state.spectral_density[child_ids] * physical_w[:, None]
-            spectral_density[parent_id] = child_density.sum(0)
-            spectral_dipole[parent_id] = (
-                physical_w[:, None, None] * (
-                    child_spectral_dipole_local[mask]
-                    + child_state.spectral_density[child_ids, :, None] * rel_p[:, None, :]
-                )
-            ).sum(0)
-            spectral_mu = child_spectral_dipole_local[mask]
-            spectral_translation = 3.0 * (
-                torch.einsum("nsi,nj->nsij", spectral_mu, rel_p)
-                + torch.einsum("ni,nsj->nsij", rel_p, spectral_mu)
-            ) - 2.0 * torch.einsum("nsi,ni->ns", spectral_mu, rel_p)[..., None, None] * eye
-            spectral_quadrupole[parent_id] = (
-                physical_w[:, None, None, None] * (
-                    child_spectral_quadrupole_local[mask]
-                    + child_state.spectral_density[child_ids, :, None, None]
-                    * raw_q2[:, None]
-                    + spectral_translation
-                )
-            ).sum(0)
+        edge_density = child_state.spectral_density[child]
+        spectral_density = _segment_sum(
+            physical_membership[:, None] * edge_density, parent, n_parent
+        )
+        spectral_dipole = _segment_sum(
+            physical_membership[:, None, None]
+            * (child_spectral_dipole_local + edge_density[:, :, None] * rel_local[:, None, :]),
+            parent,
+            n_parent,
+        )
+        spectral_translation = 3.0 * (
+            torch.einsum("esi,ej->esij", child_spectral_dipole_local, rel_local)
+            + torch.einsum("ei,esj->esij", rel_local, child_spectral_dipole_local)
+        ) - 2.0 * torch.einsum(
+            "esi,ei->es", child_spectral_dipole_local, rel_local
+        )[..., None, None] * eye
+        spectral_quadrupole = _segment_sum(
+            physical_membership[:, None, None, None]
+            * (
+                child_spectral_quadrupole_local
+                + edge_density[:, :, None, None] * raw_q2[:, None]
+                + spectral_translation
+            ),
+            parent,
+            n_parent,
+        )
 
-            numerator = vector[parent_id].norm(dim=-1).mean()
-            denominator = (
-                alpha[:, None] * child_vector_local[mask].norm(dim=-1)
-            ).sum(0).mean().clamp_min(self.cfg.frame_epsilon)
-            coherence[parent_id] = (numerator / denominator).clamp(0, 1)
-            moment_summary = torch.cat([
-                charge[parent_id, None], dipole[parent_id],
-                charge_quadrupole[parent_id].diagonal(), coherence[parent_id, None],
-            ])
-            embedding[parent_id] = self.rank_update(torch.cat([
-                pooled_embedding,
-                self.spectral_encoder(spectral_density[parent_id]),
-                moment_summary, observables[parent_id],
-            ]))
+        numerator = vector.norm(dim=-1).mean(dim=-1)
+        denominator = _segment_sum(
+            alpha[:, None] * child_vector_local.norm(dim=-1), parent, n_parent
+        ).mean(dim=-1).clamp_min(self.cfg.frame_epsilon)
+        coherence = (numerator / denominator).clamp(0, 1)
+        moment_summary = torch.cat([
+            charge[:, None],
+            dipole,
+            charge_quadrupole.diagonal(dim1=-2, dim2=-1),
+            coherence[:, None],
+        ], dim=-1)
+        embedding = self.rank_update(torch.cat([
+            pooled_embedding,
+            self.spectral_encoder(spectral_density),
+            moment_summary,
+            observables,
+        ], dim=-1))
+        parent_counts = _segment_sum(torch.ones_like(logits), parent, n_parent)
+        embedding = torch.where(
+            parent_counts[:, None] > 0, embedding, torch.zeros_like(embedding)
+        )
 
         return ElectronicCochain(
             scalar=scalar, vector=vector, quadrupole=quadrupole,
@@ -537,46 +626,33 @@ def hierarchical_candidate_indices(
         return []
     if top_coarse < 1 or max_children < 1:
         raise ValueError("top_coarse and max_children must both be positive")
-    n_queries = query_coords.size(0)
-    candidates: List[Optional[torch.Tensor]] = [None] * n_ranks
+    if query_coords.ndim != 2 or query_coords.size(-1) != 3:
+        raise ValueError("query_coords must have shape (n_query, 3)")
+    if len(fingerprint.incidences) != n_ranks - 1:
+        raise ValueError("fingerprint incidences must connect every adjacent rank")
     coarse = fingerprint.cochains[-1]
     if coarse.centers.size(0) == 0:
         raise ValueError("electronic fingerprint ranks cannot be empty")
-    coarse_k = min(top_coarse, coarse.centers.size(0))
-    candidates[-1] = torch.cdist(query_coords, coarse.centers).topk(
-        coarse_k, largest=False
-    ).indices
-
-    for rank in range(n_ranks - 2, -1, -1):
-        child, parent = fingerprint.incidences[rank]
-        selected_per_query: List[torch.Tensor] = []
-        max_width = 1
-        for query_id in range(n_queries):
-            selected_parents = candidates[rank + 1][query_id]
-            selected_parents = selected_parents[selected_parents >= 0]
-            mask = torch.isin(parent, selected_parents)
-            child_ids = child[mask].unique()
-            if child_ids.numel() == 0:
-                child_ids = torch.arange(
-                    fingerprint.cochains[rank].centers.size(0), device=query_coords.device
-                )
-            distance = (
-                fingerprint.cochains[rank].centers[child_ids]
-                - query_coords[query_id]
-            ).norm(dim=-1)
-            keep = min(max_children, child_ids.numel())
-            child_ids = child_ids[distance.topk(keep, largest=False).indices]
-            selected_per_query.append(child_ids)
-            max_width = max(max_width, child_ids.numel())
-        padded = torch.full(
-            (n_queries, max_width), -1, dtype=torch.long, device=query_coords.device
-        )
-        for query_id, child_ids in enumerate(selected_per_query):
-            padded[query_id, :child_ids.numel()] = child_ids
-        candidates[rank] = padded
-    if any(candidate is None for candidate in candidates):
-        raise RuntimeError("failed to construct candidates for every electronic rank")
-    return [candidate for candidate in candidates if candidate is not None]
+    centers = [cochain.centers for cochain in fingerprint.cochains]
+    for rank, center in enumerate(centers):
+        if center.device != query_coords.device:
+            raise ValueError("queries and all cochain centers must share a device")
+        if center.dtype != query_coords.dtype:
+            raise ValueError("queries and all cochain centers must share a dtype")
+        if center.size(0) == 0:
+            raise ValueError(f"electronic fingerprint rank {rank} is empty")
+    for rank, incidence in enumerate(fingerprint.incidences):
+        _validate_incidence(incidence, centers[rank].size(0), query_coords.device)
+        parent = incidence[1]
+        if parent.numel() and int(parent.max().item()) >= centers[rank + 1].size(0):
+            raise IndexError("incidence contains an out-of-range parent index")
+    return _core.hierarchical_candidates(
+        query_coords,
+        centers,
+        fingerprint.incidences,
+        top_coarse,
+        max_children,
+    )
 
 
 class GeometryElectronicFeedback(nn.Module):
