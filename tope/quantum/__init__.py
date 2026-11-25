@@ -86,6 +86,7 @@ from tope.quantum.relativistic_holography import (
     project_clifford_hologram,
     spinor_boost,
 )
+from tope.simulation.tensor_network import MatrixProductState, MPSWavefunction
 
 __all__ = [
     "VOIPSIRENConfig",
@@ -151,4 +152,6 @@ __all__ = [
     "poincare_to_momentum",
     "project_clifford_hologram",
     "spinor_boost",
+    "MatrixProductState",
+    "MPSWavefunction",
 ]

@@ -16,6 +16,22 @@ ToPE combines topological data analysis with SE(3)-equivariant neural networks t
 - **Mutation Effects**: DDG and activity change prediction
 - **Cooperativity**: Hill coefficient prediction for multi-subunit enzymes
 
+## Tensorized protein simulation
+
+`tope.simulation` provides research primitives for hierarchical
+quantum-classical protein simulation:
+
+- `CPFactorization` for low-rank trajectory tensors
+- `LosslessTrajectoryCoder` for exact float-bit trajectory encoding
+- `QuantizedTrajectoryCoder` for lossless encoding on a coordinate grid
+- `HarmonicSystem` for mass-weighted normal-mode propagation
+- `AnharmonicEnergy` for conservative quadratic/cubic/quartic forces
+- `MatrixProductState` for compact coefficient tensors
+
+These components are numerical tools, not validated molecular-dynamics or
+electronic-structure calculations. Physical accuracy requires reference
+force, QM/MM, and correlated-electronic benchmarks.
+
 ## Architecture
 
 ```
