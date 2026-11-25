@@ -34,6 +34,13 @@ with _warnings.catch_warnings():
         TLSCompressor,
         TLSQuantizer,
     )
+    from tope.simulation.core import (
+        CPDecomposition,
+        CPFactorization,
+        EncodedTrajectory,
+        LosslessTrajectoryCoder,
+        QuantizedTrajectoryCoder,
+    )
 
 __all__ = [
     "PolarQuant",
@@ -43,4 +50,9 @@ __all__ = [
     "TLSGroup",
     "TLSCompressor",
     "TLSQuantizer",
+    "CPDecomposition",
+    "CPFactorization",
+    "EncodedTrajectory",
+    "LosslessTrajectoryCoder",
+    "QuantizedTrajectoryCoder",
 ]

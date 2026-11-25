@@ -86,6 +86,16 @@ from tope.quantum import (
     VOIPSheafSectionBuilder,
     VOIPSIRENConfig,
 )
+from tope.simulation import (
+    AnharmonicEnergy,
+    CPDecomposition,
+    CPFactorization,
+    HarmonicSystem,
+    LosslessTrajectoryCoder,
+    QuantizedTrajectoryCoder,
+    MatrixProductState,
+    MPSWavefunction,
+)
 
 __all__ = [
     "__version__",
@@ -125,4 +135,13 @@ __all__ = [
     "AttentiveVOIPEncoder",
     "VOIPSheafSectionBuilder",
     "VOIPSIRENConfig",
+    # Tensorized protein simulation
+    "AnharmonicEnergy",
+    "CPDecomposition",
+    "CPFactorization",
+    "HarmonicSystem",
+    "LosslessTrajectoryCoder",
+    "QuantizedTrajectoryCoder",
+    "MatrixProductState",
+    "MPSWavefunction",
 ]
