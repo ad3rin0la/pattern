@@ -25,8 +25,16 @@ class HodgeDiffusionConfig:
     chain_tolerance: float = 1e-5
     eigenvalue_tolerance: float = 1e-7
     validate_chain: bool = True
+    backend: str = "spectral"
+    chebyshev_degree: int = 24
 
     def __post_init__(self) -> None:
+        if self.backend not in {"spectral", "chebyshev"}:
+            raise ValueError("backend must be spectral or chebyshev")
+        if not isinstance(self.chebyshev_degree, int) or self.chebyshev_degree < 4:
+            raise ValueError("chebyshev_degree must be an integer >= 4")
+        if self.backend == "chebyshev" and self.max_modes is not None:
+            raise ValueError("max_modes requires the spectral backend")
         if self.max_modes is not None and self.max_modes < 1:
             raise ValueError("max_modes must be positive or None")
         if self.chain_tolerance < 0 or self.eigenvalue_tolerance < 0:
@@ -63,6 +71,60 @@ class HodgeDecomposition:
     harmonic: torch.Tensor
 
 
+@dataclass
+class PolynomialHodgeDiffusionResult:
+    """Heat reconstruction without an eigenbasis or modal coefficients."""
+
+    rank: int
+    times: torch.Tensor
+    reconstruction: torch.Tensor
+    spectral_upper_bound: torch.Tensor
+    steps: int
+
+
+def _coo_chain_product_values(
+    left: torch.Tensor, right: torch.Tensor
+) -> torch.Tensor:
+    """Return coalesced values of a COO product without creating sparse CSR.
+
+    PyTorch's COO-by-COO matmul currently routes through beta CSR support and
+    emits a process-wide warning. Boundary matrices are incidence-sparse, so a
+    join on their shared cell rank computes the same signed path sums while
+    keeping storage proportional to composable incidences.
+    """
+    left = left.coalesce()
+    right = right.coalesce()
+    li, lv = left.indices(), left.values()
+    ri, rv = right.indices(), right.values()
+    if not lv.numel() or not rv.numel():
+        return lv.new_empty(0)
+
+    rows, columns, products = [], [], []
+    shared = torch.unique(torch.cat([li[1], ri[0]]))
+    for cell in shared:
+        left_edges = torch.where(li[1] == cell)[0]
+        right_edges = torch.where(ri[0] == cell)[0]
+        if not left_edges.numel() or not right_edges.numel():
+            continue
+        rows.append(li[0, left_edges].repeat_interleave(right_edges.numel()))
+        columns.append(ri[1, right_edges].repeat(left_edges.numel()))
+        products.append(
+            lv[left_edges].repeat_interleave(right_edges.numel())
+            * rv[right_edges].repeat(left_edges.numel())
+        )
+    if not products:
+        return lv.new_empty(0)
+    indices = torch.stack([torch.cat(rows), torch.cat(columns)])
+    product = torch.sparse_coo_tensor(
+        indices,
+        torch.cat(products),
+        (left.size(0), right.size(1)),
+        dtype=lv.dtype,
+        device=lv.device,
+    ).coalesce()
+    return product.values()
+
+
 def validate_boundary_operators(
     boundaries: Sequence[torch.Tensor], tolerance: float = 1e-5
 ) -> None:
@@ -78,11 +140,12 @@ def validate_boundary_operators(
             raise ValueError(f"B_{index + 1} must be a matrix")
         if not boundary.is_floating_point():
             raise TypeError("boundary operators must use floating values")
-        if boundary.layout != torch.strided:
-            raise TypeError("boundary operators must currently be dense tensors")
+        if boundary.layout not in {torch.strided, torch.sparse_coo}:
+            raise TypeError("boundary operators must be dense or sparse COO tensors")
         if boundary.device != reference.device or boundary.dtype != reference.dtype:
             raise ValueError("boundary operators must share one device and dtype")
-        if not torch.isfinite(boundary).all():
+        values = boundary.coalesce().values() if boundary.is_sparse else boundary
+        if not torch.isfinite(values).all():
             raise ValueError("boundary operators must contain only finite values")
         if index:
             previous = boundaries[index - 1]
@@ -90,7 +153,11 @@ def validate_boundary_operators(
                 raise ValueError(
                     f"B_{index} and B_{index + 1} have incompatible cell counts"
                 )
-            residue = previous @ boundary
+            if previous.is_sparse and boundary.is_sparse:
+                residue = _coo_chain_product_values(previous, boundary)
+            else:
+                residue = previous @ boundary
+                residue = residue.coalesce().values() if residue.is_sparse else residue
             if residue.numel() and residue.abs().max().item() > tolerance:
                 raise ValueError(
                     f"chain condition failed: B_{index} @ B_{index + 1} != 0; "
@@ -121,9 +188,11 @@ def hodge_laplacian(
     )
     if rank > 0:
         lower = boundaries[rank - 1]
+        lower = lower.to_dense() if lower.is_sparse else lower
         laplacian = laplacian + lower.transpose(-2, -1) @ lower
     if rank < len(boundaries):
         upper = boundaries[rank]
+        upper = upper.to_dense() if upper.is_sparse else upper
         laplacian = laplacian + upper @ upper.transpose(-2, -1)
     return 0.5 * (laplacian + laplacian.transpose(-2, -1))
 
@@ -158,6 +227,7 @@ def hodge_decomposition(
     def project_onto_columns(image: torch.Tensor) -> torch.Tensor:
         if image.size(1) == 0:
             return torch.zeros_like(working)
+        image = image.to_dense() if image.is_sparse else image
         image = image.to(dtype=working.dtype, device=working.device)
         if rcond is None:
             return image @ (torch.linalg.pinv(image) @ working)
@@ -237,7 +307,11 @@ class HodgeHeatDiffusion(nn.Module):
     def forward(
         self, signals: Sequence[torch.Tensor], boundaries: Sequence[torch.Tensor],
         times: Union[torch.Tensor, float],
-    ) -> List[HodgeDiffusionResult]:
+    ) -> List[Union[HodgeDiffusionResult, PolynomialHodgeDiffusionResult]]:
+        if self.config.backend == "chebyshev":
+            from tope.models.chebyshev_hodge import chebyshev_heat
+
+            return chebyshev_heat(signals, boundaries, times, self.config)
         spectra = self.spectra(boundaries)
         if len(signals) != len(spectra):
             raise ValueError("signals must provide one cochain for every Hodge rank")
@@ -265,7 +339,7 @@ class ElectronicHodgeDiffusion(nn.Module):
         boundaries: Sequence[torch.Tensor], times: Union[torch.Tensor, float],
         field: str = "embedding",
         frame: str = "global",
-    ) -> List[HodgeDiffusionResult]:
+    ) -> List[Union[HodgeDiffusionResult, PolynomialHodgeDiffusionResult]]:
         if field not in self.ALLOWED_FIELDS:
             raise ValueError(f"unsupported electronic field: {field}")
         if len(fingerprint.cochains) != len(boundaries) + 1:

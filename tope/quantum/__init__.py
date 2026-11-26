@@ -33,6 +33,24 @@ from tope.quantum.voip_siren import (
     VOIPSheafSectionBuilder,
 )
 from tope.quantum.gyro_dnc import GyroMemory
+from tope.quantum.gauge_connection import (
+    GaugeAction,
+    GaugeDiagnostics,
+    GaugeTier,
+    GaugeTriggerConfig,
+    GaugeTriggerPolicy,
+    MPSAlignment,
+    OrbitalAlignment,
+    align_global_phase,
+    align_mps,
+    align_orbitals,
+    holonomy_deviation,
+    left_canonicalize_mps,
+    mps_overlap,
+    orbital_overlap,
+    procrustes_transport,
+    wilson_loop,
+)
 from tope.quantum.electronic_complex import (
     AdaptiveElectronicReadout,
     ElectronicCochain,
@@ -101,6 +119,23 @@ __all__ = [
     "VOIPSheafSectionBuilder",
     # Phase 5G
     "GyroMemory",
+    # Orbital and tensor-network gauge connection
+    "GaugeAction",
+    "GaugeDiagnostics",
+    "GaugeTier",
+    "GaugeTriggerConfig",
+    "GaugeTriggerPolicy",
+    "MPSAlignment",
+    "OrbitalAlignment",
+    "align_global_phase",
+    "align_mps",
+    "align_orbitals",
+    "holonomy_deviation",
+    "left_canonicalize_mps",
+    "mps_overlap",
+    "orbital_overlap",
+    "procrustes_transport",
+    "wilson_loop",
     # Geometry-aware multirank electronic cochains
     "ElectronicComplexConfig",
     "ElectronicCochain",

@@ -41,6 +41,12 @@ from tope.models.whole_protein_tcpnet import (
     WholeProteinConfig,
     WholeProteinTCPNet,
 )
+from tope.models.cost_aware import (
+    CostAwareConfig,
+    CostAwareGate,
+    GateDecision,
+    WorkEstimate,
+)
 from tope.models.multi_scale_graph import (
     MultiScaleGraphConfig,
     MultiScaleProteinGraph,
@@ -65,6 +71,7 @@ from tope.models.hodge_diffusion import (
     HodgeDiffusionConfig,
     HodgeDecomposition,
     HodgeDiffusionResult,
+    PolynomialHodgeDiffusionResult,
     HodgeHeatDiffusion,
     HodgeSpectrum,
     hodge_laplacian,
@@ -181,6 +188,7 @@ __all__ = [
     "HodgeSpectrum",
     "HodgeDiffusionResult",
     "HodgeHeatDiffusion",
+    "PolynomialHodgeDiffusionResult",
     "ElectronicHodgeDiffusion",
     "CoupledTorsionState",
     "CoupledTorsionHarmonics",
@@ -219,6 +227,11 @@ __all__ = [
     # Whole protein
     "WholeProteinConfig",
     "WholeProteinTCPNet",
+    # Cost-aware optional execution
+    "CostAwareConfig",
+    "CostAwareGate",
+    "GateDecision",
+    "WorkEstimate",
     # Multi-scale graph
     "MultiScaleGraphConfig",
     "MultiScaleProteinGraph",
